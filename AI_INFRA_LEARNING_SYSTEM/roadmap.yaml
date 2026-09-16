@@ -1,4 +1,4 @@
-version: 1.0.0
+version: 1.1.0
 updated_at: 2026-09-16
 decision_review_at: 2026-12-16
 status: conditional_investment
@@ -10,6 +10,8 @@ product_entry: livekit_agents
 future_option: lerobot
 primary_specialization: agent_rl_kv_cache_scheduling_routing_correctness
 current_phase: phase_0
+current_week: week_01
+current_week_plan: weeks/week_01/README.md
 phases:
   - id: phase_0
     name: baseline_and_environment

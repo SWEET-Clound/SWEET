@@ -13,6 +13,7 @@
 - [方向与替代风险审计](DECISION_MEMO.md)
 - [当前仓库能力基线](CURRENT_BASELINE_ASSESSMENT.md)
 - [前 12 周逐周执行](NEXT_12_WEEKS.md)
+- [第 1 周详细计划](weeks/week_01/README.md)
 - [人机协作协议](COLLABORATION_PROTOCOL.md)
 - [机器可读路线状态](roadmap.yaml)
 - [路线变更记录](CHANGELOG.md)
