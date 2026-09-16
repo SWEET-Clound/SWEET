@@ -1,0 +1,110 @@
+version: 1.0.0
+updated_at: 2026-09-16
+decision_review_at: 2026-12-16
+status: conditional_investment
+weekly_hours_target: 15
+weekly_hours_minimum: 10
+primary_ecosystem: sglang
+comparison_ecosystem: vllm
+product_entry: livekit_agents
+future_option: lerobot
+primary_specialization: agent_rl_kv_cache_scheduling_routing_correctness
+current_phase: phase_0
+phases:
+  - id: phase_0
+    name: baseline_and_environment
+    weeks: "1-2"
+    exit_evidence:
+      - completed_baseline
+      - reproducible_environment
+      - at_least_10_tests
+  - id: phase_1
+    name: engineering_and_model_foundations
+    weeks: "3-8"
+    exit_evidence:
+      - mini_inference_lab
+      - kv_cache_correctness_test
+      - profiler_bottleneck_report
+  - id: phase_2
+    name: serving_and_benchmarking
+    weeks: "9-16"
+    exit_evidence:
+      - transformers_vllm_sglang_comparison
+      - raw_benchmark_data
+      - reproducible_report
+  - id: phase_3
+    name: source_and_upstream_contribution
+    months: "5-8"
+    exit_evidence:
+      - two_effective_pull_requests
+      - one_merged_or_substantively_reviewed
+  - id: phase_4
+    name: realtime_multimodal_product
+    months: "9-12"
+    exit_evidence:
+      - fifty_real_sessions
+      - five_real_testers
+      - latency_and_task_metrics
+  - id: phase_5
+    name: production_reliability
+    months: "13-15"
+    exit_evidence:
+      - seven_day_run
+      - ten_fault_classes
+      - regression_gate
+  - id: phase_6
+    name: specialization
+    months: "16-18"
+    exit_evidence:
+      - original_workload_or_eval
+      - upstream_contribution
+      - external_reproduction_or_adoption
+  - id: phase_7
+    name: original_value_and_external_validation
+    months: "19-24"
+    exit_evidence:
+      - flagship_project
+      - external_users
+      - transferable_method
+confidence_gates:
+  gate_0:
+    due: "week_8_to_12"
+    confidence_after_pass: "65-70%"
+    requires:
+      - two_backend_reproducible_result
+      - repeated_measurements
+      - profiler_supported_bottleneck
+      - continued_interest
+  gate_1:
+    due: "month_3_to_4"
+    confidence_after_pass: "70-78%"
+    requires:
+      - correctness_latency_cost_benchmark
+      - reproducible_regression
+      - nontrivial_upstream_feedback
+  gate_2:
+    due: "month_6_to_8"
+    confidence_after_pass: "78-85%"
+    requires:
+      - at_least_15_percent_tail_latency_or_cost_improvement
+      - no_quality_or_correctness_regression
+      - second_engine_or_hardware_explanation
+  gate_3:
+    due: "month_9_to_12"
+    confidence_after_pass: "85-90%"
+    requires_any:
+      - external_team_adoption
+      - two_substantive_merged_pull_requests
+      - paid_pilot_internship_or_collaboration
+  gate_4:
+    due: "month_12_to_18"
+    requires:
+      - hard_to_copy_workload_trace_eval_or_hardware_experience
+      - real_incident_or_capacity_problem
+      - transfer_to_new_model_hardware_or_engine
+stop_rules:
+  - tutorial_only_after_eight_weeks
+  - no_credible_benchmark_after_four_months
+  - no_technical_feedback_or_users_after_six_months
+  - target_optimization_commoditized_within_ten_percent
+  - project_declines_for_two_consecutive_quarters
