@@ -14,3 +14,8 @@ __pycache__/
 .pnpm-store/
 sglang-learning-dashboard/
 
+# Local generated files kept for this machine's learning environment.
+# They are intentionally preserved on disk but are not SWEET source files.
+requirements-dev.txt
+sglang-learning-dashboard.package-lock.json
+
