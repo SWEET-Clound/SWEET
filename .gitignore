@@ -1,0 +1,15 @@
+.venv/
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Machine-specific PyCharm module configuration. The file remains on disk,
+# but it must not be versioned because it contains an absolute local SDK path.
+.idea/SWEET.iml
+
+# Independent local artifacts. `sglang-learning-dashboard` has its own Git
+# history and is not part of the SWEET repository.
+.pnpm-store/
+sglang-learning-dashboard/
+
