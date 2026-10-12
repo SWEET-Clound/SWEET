@@ -7,6 +7,7 @@ __pycache__/
 # Machine-specific PyCharm module configuration. The file remains on disk,
 # but it must not be versioned because it contains an absolute local SDK path.
 .idea/SWEET.iml
+.idea/vcs.xml
 
 # Independent local artifacts. `sglang-learning-dashboard` has its own Git
 # history and is not part of the SWEET repository.
