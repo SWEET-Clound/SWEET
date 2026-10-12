@@ -4,6 +4,25 @@
 > 每周完成后复制 `templates/WEEKLY_REVIEW.md`，以 `reviews/YYYY-Www.md` 命名。  
 > 任何任务未通过验收时，延长当前周，不带病进入下一阶段。
 
+详细执行包与入口：
+
+| 周 | 执行包 |
+| ---: | --- |
+| 1 | [week_01](weeks/week_01/START_HERE.md) |
+| 2 | [week_02](weeks/week_02/START_HERE.md) |
+| 3 | [week_03](weeks/week_03/README.md) |
+| 4 | [week_04](weeks/week_04/README.md) |
+| 5 | [week_05](weeks/week_05/README.md) |
+| 6 | [week_06](weeks/week_06/README.md) |
+| 7 | [week_07](weeks/week_07/README.md) |
+| 8 | [week_08](weeks/week_08/README.md) |
+| 9 | [week_09](weeks/week_09/README.md) |
+| 10 | [week_10](weeks/week_10/README.md) |
+| 11 | [week_11](weeks/week_11/README.md) |
+| 12 | [week_12](weeks/week_12/README.md) |
+
+总对齐审计见 [WEEKS_01_12_AUDIT.md](WEEKS_01_12_AUDIT.md)。
+
 ## 第 1 周：建立权威基线
 
 主问题：现在的环境和能力能否被客观描述？
