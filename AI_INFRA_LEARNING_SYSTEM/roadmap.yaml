@@ -1,5 +1,5 @@
-version: 1.1.0
-updated_at: 2026-09-16
+version: 1.6.0
+updated_at: 2026-10-04
 decision_review_at: 2026-12-16
 status: conditional_investment
 weekly_hours_target: 15
@@ -10,8 +10,8 @@ product_entry: livekit_agents
 future_option: lerobot
 primary_specialization: agent_rl_kv_cache_scheduling_routing_correctness
 current_phase: phase_0
-current_week: week_01
-current_week_plan: weeks/week_01/README.md
+current_week: week_02
+current_week_plan: weeks/week_02/START_HERE.md
 phases:
   - id: phase_0
     name: baseline_and_environment
@@ -21,47 +21,55 @@ phases:
       - reproducible_environment
       - at_least_10_tests
   - id: phase_1
-    name: engineering_and_model_foundations
+    name: agent_engineering_and_reproducibility_foundations
     weeks: "3-8"
+    exit_evidence:
+      - offline_agent_contract_and_lifecycle_tests
+      - deterministic_synthetic_workload_and_data_card
+      - pinned_sglang_source_test_map
+      - clean_environment_stability_evidence
+  - id: phase_2
+    name: model_and_single_request_inference_foundations
+    weeks: "9-12"
     exit_evidence:
       - mini_inference_lab
       - kv_cache_correctness_test
       - profiler_bottleneck_report
-  - id: phase_2
+  - id: phase_3
     name: serving_and_benchmarking
-    weeks: "9-16"
+    weeks: "13-16"
     exit_evidence:
       - transformers_vllm_sglang_comparison
       - raw_benchmark_data
       - reproducible_report
-  - id: phase_3
+  - id: phase_4
     name: source_and_upstream_contribution
     months: "5-8"
     exit_evidence:
       - two_effective_pull_requests
       - one_merged_or_substantively_reviewed
-  - id: phase_4
+  - id: phase_5
     name: realtime_multimodal_product
     months: "9-12"
     exit_evidence:
       - fifty_real_sessions
       - five_real_testers
       - latency_and_task_metrics
-  - id: phase_5
+  - id: phase_6
     name: production_reliability
     months: "13-15"
     exit_evidence:
       - seven_day_run
       - ten_fault_classes
       - regression_gate
-  - id: phase_6
+  - id: phase_7
     name: specialization
     months: "16-18"
     exit_evidence:
       - original_workload_or_eval
       - upstream_contribution
       - external_reproduction_or_adoption
-  - id: phase_7
+  - id: phase_8
     name: original_value_and_external_validation
     months: "19-24"
     exit_evidence:
@@ -73,7 +81,8 @@ confidence_gates:
     due: "week_8_to_12"
     confidence_after_pass: "65-70%"
     requires:
-      - two_backend_reproducible_result
+      - deterministic_workload_and_data_card
+      - local_cache_correctness_result
       - repeated_measurements
       - profiler_supported_bottleneck
       - continued_interest

@@ -1,6 +1,6 @@
 # AI 推理系统与实时多模态学习操作系统
 
-> 版本：v1.0  
+> 版本：v1.6
 > 建立日期：2026-09-16  
 > 主航道：SGLang 生态  
 > 辅助参照：vLLM、PyTorch、Triton、LiveKit Agents  
@@ -14,6 +14,33 @@
 - [当前仓库能力基线](CURRENT_BASELINE_ASSESSMENT.md)
 - [前 12 周逐周执行](NEXT_12_WEEKS.md)
 - [第 1 周详细计划](weeks/week_01/README.md)
+- [第 1 周从这里开始](weeks/week_01/START_HERE.md)
+- [第 2 周从这里开始](weeks/week_02/START_HERE.md)
+- [第 2 周完整学习路径](weeks/week_02/README.md)
+- [第 2 周计划审核](weeks/week_02/AUDIT.md)
+- [前 12 周路线一致性审计](WEEKS_01_12_AUDIT.md)
+- [第 3–12 周官方资料索引](WEEKS_03_12_RESOURCES.md)
+- [第 3–12 周学习包索引](WEEKLY_PACKET_INDEX.md)
+- [学习包执行标准](LEARNING_PACKET_STANDARD.md)
+- [第 3–12 周定向阅读导引](WEEKS_03_12_READING_GUIDE.md)
+- [项目掌握验证阶梯](MASTERY_LADDER.md)
+- [实验脚手架与环境门](LAB_BOOTSTRAP_AND_ENVIRONMENT.md)
+- [板块—练习清单](MODULE_EXERCISE_MANIFEST.md)
+- [SGLang 源码工作流](SGLANG_SOURCE_WORKFLOW.md)
+- [SGLang 源码练习册](SGLANG_EXERCISE_MANIFEST.md)
+- [SGLang 测试矩阵](SGLANG_TEST_MATRIX.md)
+- [贡献就绪检查](CONTRIBUTION_READINESS.md)
+- [Week 3–12 SGLang 源码与工作负载副线](SGLANG_SOURCE_COMPANION.md)
+- [第 3 周：包结构、类型与质量门禁](weeks/week_03/README.md)
+- [第 4 周：HTTP 服务与月度复盘](weeks/week_04/README.md)
+- [第 5 周：异步、流式与取消](weeks/week_05/README.md)
+- [第 6 周：并发与背压](weeks/week_06/README.md)
+- [第 7 周：Tracing 与故障注入](weeks/week_07/README.md)
+- [第 8 周：工程地基审计](weeks/week_08/README.md)
+- [第 9 周：Tensor、dtype 与设备](weeks/week_09/README.md)
+- [第 10 周：Attention](weeks/week_10/README.md)
+- [第 11 周：最小 Decoder 与 profiler](weeks/week_11/README.md)
+- [第 12 周：KV Cache 与 Gate 0B](weeks/week_12/README.md)
 - [人机协作协议](COLLABORATION_PROTOCOL.md)
 - [机器可读路线状态](roadmap.yaml)
 - [路线变更记录](CHANGELOG.md)
@@ -217,63 +244,40 @@ AI 编码工具会显著提高实现速度，但它也会放大“能否定义�
 
 通过门槛：换一台机器时，可以只看文档在 2 小时内重建环境。
 
-## 阶段 1：工程与模型基础（第 3–8 周）
+## 阶段 1：Agent 工程与可复现系统基础（第 3–8 周）
 
-目标：补齐阅读推理系统源码所需的最低基础。
+目标：让当前 Agent 成为一个有边界、可测试、可取消、可测量的小系统；同时建立进入 SGLang 源码的安全入口。
 
-必须掌握：
+必须掌握：模块边界和类型、HTTP/SSE、请求身份、async/cancel、队列/背压、trace/retry、干净环境重建；并建立 synthetic/脱敏的 Agent workload、数据卡和固定 SHA 的 SGLang test map。
 
-- Python：迭代器、生成器、装饰器、类型、dataclass/msgspec、asyncio、multiprocessing；
-- 系统：进程/线程、IPC、socket、HTTP/SSE、序列化、日志；
-- PyTorch：Tensor、device、dtype、autograd 基础、module、显存；
-- Transformer：tokenization、embedding、attention、RoPE、MLP、采样；
-- 推理：prefill、decode、KV cache、batching、quantization；
-- 测试：unit、integration、benchmark、随机性控制。
+项目 P1：`agent-cache-workload-foundation`
 
-项目 P1：`mini-inference-lab`
+- 为当前 Agent 建立纯逻辑、HTTP、SSE、cancel、queue 与 trace 的可测边界；
+- 固定 synthetic request/session/shared-prefix JSONL，保留生成 seed 与数据限制；
+- 用 CPU/unit test 为 SGLang cache/scheduler 问题建立源码入口；
+- 至少 30 个边界测试、稳定重跑证据与 clean-venv 重建记录。
 
-- 用 PyTorch 实现一个极小 Transformer 的推理路径；
-- 显示 prefill/decode 两阶段耗时；
-- 实现最简单 KV cache，并与无 cache 版本对比；
-- 添加 greedy、temperature、top-k/top-p；
-- 记录不同序列长度的时间和内存；
-- 至少 20 个测试。
+通过门槛：能画出 HTTP→service→stream/cancel→queue→trace 的数据流；能解释超时、重试和所有权边界；能重放 workload 并说明其不代表什么；能引用固定 SHA 的测试/调用图。
 
-通过门槛：
+## 阶段 2：模型、单请求推理与 KV Cache 基础（第 9–12 周）
 
-- 能画出一次请求的数据流；
-- 能解释为什么 decode 通常更受内存带宽影响；
-- 能用实验展示 KV cache 的收益与代价；
-- 项目在干净环境可复现。
+目标：从可验证 Tensor 实验建立到最小 Decoder、causal attention、local KV cache 正确性与测量的共同语言。
 
-## 阶段 2：Serving 与基准系统（第 9–16 周）
+项目 P2：`mini-inference-lab`
 
-目标：从“模型推理”进入“多请求推理系统”。
+- 建立 Tensor shape/dtype/device、误差、计时与 profiler 的原始证据；
+- 实现 full-prefill causal attention 与 no-cache deterministic decoder；
+- 实现 per-request KV cache，并逐 token 验证与无 cache logits 一致；
+- 保存 context/output 矩阵的原始 CSV、环境和 profiler trace；
+- 明确 local cache 未覆盖 prefix sharing、eviction、page allocation 与服务调度。
 
-主题：
+通过门槛：第三个人能按 README 重现实验；所有结论可回溯至原始数据；不把 local first-token compute 误写为服务 TTFT。
 
-- continuous batching；
-- TTFT、TPOT、ITL、吞吐和 goodput；
-- 静态/动态 batch；
-- 请求长度分布与并发；
-- PagedAttention/RadixAttention；
-- prefix caching；
-- structured output；
-- OpenAI-compatible serving；
-- tracing、metrics、load generation。
+## 阶段 3：Serving 与双后端 benchmark（第 13–16 周）
 
-项目 P2：`serving-benchmark`
+目标：在同一模型、同一机器、同一 workload 下比较 Transformers、vLLM 与 SGLang。此阶段才测端到端 TTFT、ITL、TPOT、吞吐、错误率和峰值显存；必须保留 raw JSON/CSV、环境、commit SHA 与公平性审计。
 
-- 同一模型、同一机器运行 Transformers、vLLM、SGLang；
-- 至少设计三种 workload：短对话、长上下文、共享前缀 Agent；
-- 控制 warmup、seed、请求到达率、输入/输出长度；
-- 输出 P50/P95/P99 TTFT、TPOT、吞吐、错误率、峰值显存；
-- 保存环境、commit SHA、命令、原始 JSON/CSV；
-- 分析结果而不是只画柱状图。
-
-通过门槛：第三个人能按 README 重现实验；所有结论都能追溯到原始数据；能解释两个引擎差异的至少两个源码依据。
-
-## 阶段 3：SGLang 源码与第一次贡献（第 5–8 月）
+## 阶段 4：SGLang 源码与第一次贡献（第 5–8 月）
 
 目标：从使用者变成能修改和验证的贡献者。
 
@@ -312,7 +316,7 @@ AI 编码工具会显著提高实现速度，但它也会放大“能否定义�
 - 能独立运行相关 unit test 和最小 E2E；
 - 能说明修改涉及的正确性、性能和兼容性风险。
 
-## 阶段 4：实时多模态系统（第 9–12 月）
+## 阶段 5：实时多模态系统（第 9–12 月）
 
 目标：把推理知识转化为用户可感知价值。
 
@@ -344,7 +348,7 @@ AI 编码工具会显著提高实现速度，但它也会放大“能否定义�
 
 通过门槛：至少 5 名真实测试者、50 次完整会话、公开失败案例和下一版决策。没有真实用户反馈不得宣称“生产级”。
 
-## 阶段 5：生产可靠性（第 13–15 月）
+## 阶段 6：生产可靠性（第 13–15 月）
 
 目标：证明系统不仅能演示，而且能被测量、恢复和安全降级。
 
@@ -371,7 +375,7 @@ AI 编码工具会显著提高实现速度，但它也会放大“能否定义�
 - 每类故障可由 trace 定位；
 - 性能/正确性回归超过阈值可自动阻断合并。
 
-## 阶段 6：专业化（第 16–18 月）
+## 阶段 7：专业化（第 16–18 月）
 
 在以下方向中只选一个主方向、一个辅方向。
 
@@ -428,7 +432,7 @@ AI 编码工具会显著提高实现速度，但它也会放大“能否定义�
 - 至少一个高质量上游 Issue/PR；
 - 一套领域 workload 或评测集。
 
-## 阶段 7：原创价值与外部验证（第 19–24 月）
+## 阶段 8：原创价值与外部验证（第 19–24 月）
 
 目标：从“学习已有系统”转向“提出并验证自己的问题”。
 
@@ -457,16 +461,16 @@ AI 编码工具会显著提高实现速度，但它也会放大“能否定义�
 | --- | --- | --- |
 | 1 | 环境与能力基线 | 环境文档、硬件清单、自测结果 |
 | 2 | 当前 Agent 工程化 | 配置、测试、日志、README |
-| 3 | Tensor/dtype/device | 10 个小实验与笔记 |
-| 4 | Transformer 推理路径 | 手绘数据流、最小实现 |
-| 5 | Prefill/decode 与 KV cache | 有/无 cache 对照实验 |
-| 6 | asyncio、SSE、并发 | 流式服务与并发测试 |
-| 7 | 采样与结构化输出 | 测试覆盖边界条件 |
-| 8 | 阶段复盘 | P1 发布、缺口清单 |
-| 9 | 启动三个 serving 后端 | 可复现启动脚本 |
-| 10 | 负载发生器与指标 | 原始数据 schema、单测 |
-| 11 | 短/长/共享前缀实验 | 第一版 benchmark 数据 |
-| 12 | 公平性和误差审计 | 报告 v0.1、下一轮假设 |
+| 3 | 包结构、类型与质量门 | ADR、离线测试、质量门、SGLang repo/test map |
+| 4 | HTTP、身份与错误边界 | contract/fake/health/trace schema v0 |
+| 5 | async、SSE、取消 | 流协议、cancel cleanup、session 生命周期图 |
+| 6 | 并发、背压与 workload | deterministic JSONL、queue 实验、指标映射 |
+| 7 | tracing、retry 与故障注入 | trace/fault matrix、failure taxonomy、scheduler 调用图 |
+| 8 | 工程复现与 Gate 0A | clean venv、稳定 runner、数据卡、issue card |
+| 9 | Tensor/dtype/device | 10 微实验、raw CSV、profiler、executor inventory |
+| 10 | causal attention | handcalc、性质测试、SDPA 对照、backend 问题卡 |
+| 11 | 最小 Decoder | no-cache generate、replay harness、prefill/decode map |
+| 12 | KV Cache 与 Gate 0B | cache correctness、benchmark、radix cache 测试提案 |
 
 详细执行时，始终只提前规划未来两周；12 周表是路线，不是不可改变的日历。
 
