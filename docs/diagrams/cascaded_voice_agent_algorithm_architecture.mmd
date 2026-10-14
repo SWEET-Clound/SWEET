@@ -1,0 +1,55 @@
+flowchart TB
+    INPUT[SmallWebRTCTransport 输入<br/>Opus → 16kHz mono PCM]
+
+    subgraph PIPE[Pipecat 首版流水线]
+        VAD[Silero VAD<br/>speaking_started / speaking_stopped]
+        STT[AliyunStreamingSTTService<br/>partial / final]
+        TURN[TurnCoordinator Processor<br/>turn_id / 打断 / 迟到事件丢弃]
+        CTX[LLM Context Aggregator]
+        AGENT[VoiceAgent LLM Processor<br/>唯一父智能体]
+        CHUNK[SentenceChunker<br/>标点 / 长度 / 超时切片]
+        TTS[CosyVoiceTTSService<br/>流式音频]
+        OUTPUT[SmallWebRTCTransport 输出]
+        INPUT --> VAD --> STT --> TURN --> CTX --> AGENT --> CHUNK --> TTS --> OUTPUT
+    end
+
+    subgraph TASK[异步子智能体支路]
+        TOOL[delegate_task / cancel_task]
+        GATEWAY[AgentTaskGateway]
+        TASKSTATE[ActiveTask<br/>每会话最多一个]
+        CHILD[ChildAgentSSEAdapter]
+        REGISTRY[受信任注册表<br/>首版仅 SearchAgent]
+        RESULT[TaskResult Event<br/>completed / failed / cancelled]
+        TOOL --> GATEWAY --> TASKSTATE --> CHILD --> REGISTRY
+        CHILD --> RESULT
+    end
+
+    AGENT -.立即返回 accepted + task_id.-> TOOL
+    RESULT -.安全话轮注入原会话.-> CTX
+    VAD -.用户插话.-> TURN
+    TURN -.取消旧 LLM / TTS，查询默认继续.-> AGENT
+    TURN -.清空未播放音频.-> OUTPUT
+
+    subgraph CUSTOM[自研完整编排参考 - 不在首版实现]
+        BUS[PriorityEventBus]
+        MEDIA[MediaLoop]
+        OWN[TurnCoordinator]
+        ASRPORT[ASRStream Adapter]
+        CONV[ConversationAgent]
+        SPEECH[SpeechOutput]
+        MEDIA --> BUS --> OWN
+        OWN --> ASRPORT --> CONV --> SPEECH
+        SPEECH --> MEDIA
+    end
+
+    MAP[迁移对应关系：Pipecat Frame/PipelineTask → PriorityEventBus；Processor → Adapter；TurnCoordinator 保持接口]
+    PIPE --- MAP --- CUSTOM
+
+    classDef core fill:#e7f5ff,stroke:#1971c2,color:#0b2740;
+    classDef parent fill:#ebfbee,stroke:#2b8a3e,color:#163d1d;
+    classDef task fill:#fff4e6,stroke:#e8590c,color:#5f2c00;
+    classDef future fill:#f1f3f5,stroke:#868e96,color:#343a40,stroke-dasharray: 5 5;
+    class INPUT,VAD,STT,TURN,CTX,CHUNK,TTS,OUTPUT core;
+    class AGENT parent;
+    class TOOL,GATEWAY,TASKSTATE,CHILD,REGISTRY,RESULT task;
+    class BUS,MEDIA,OWN,ASRPORT,CONV,SPEECH,MAP future;

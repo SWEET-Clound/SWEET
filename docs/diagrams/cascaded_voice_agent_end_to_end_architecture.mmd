@@ -1,0 +1,68 @@
+flowchart LR
+    subgraph APP[手机 App - 前端负责，仅规划]
+        MIC[麦克风 / 系统音频会话]
+        RTC[WebRTC PeerConnection]
+        PLAY[音频播放 / 打断 / 状态显示]
+        MIC --> RTC --> PLAY
+    end
+
+    subgraph BE[业务后端 - 后端负责，仅规划]
+        AUTH[校验 App 登录态]
+        CONTEXT[生成可信 tenant / user / search_range]
+        SESSION[创建短期 voice session]
+        SIGNAL[信令 / ICE 配置]
+        AUTH --> CONTEXT --> SESSION --> SIGNAL
+    end
+
+    subgraph ALG[Voice Agent Service - 算法负责，实现]
+        TRANSPORT[Pipecat SmallWebRTCTransport]
+        PIPELINE[级联语音流水线<br/>VAD → ASR → VoiceAgent LLM → TTS]
+        PARENT[级联语音父智能体<br/>唯一最终对话权]
+        TASKS[AgentTaskGateway<br/>单个异步子任务]
+        TRANSPORT <--> PIPELINE
+        PIPELINE <--> PARENT
+        PARENT <--> TASKS
+    end
+
+    subgraph CLOUD[云模型 API]
+        VAD[Silero VAD - 算法本地]
+        ASR[阿里云实时 ASR]
+        LLM[Qwen 流式文本 LLM]
+        TTS[CosyVoice 流式 TTS]
+    end
+
+    subgraph QLL[qll_chat 多智能体能力]
+        RUNTIME[子智能体任务运行时]
+        REGISTRY[受信任子 Agent 注册表]
+        SEARCH[SearchAgent - 首版]
+        FUTURE[GenericAgent / OAAgent - 后续]
+        RUNTIME --> REGISTRY --> SEARCH
+        REGISTRY -.后续.-> FUTURE
+    end
+
+    APP -.App 登录凭证.-> AUTH
+    SIGNAL -.offer / answer / ICE.-> RTC
+    SESSION -.短期会话凭证 + 可信上下文.-> TRANSPORT
+    RTC == WebRTC 双向音频 ==> TRANSPORT
+    PIPELINE --> VAD
+    PIPELINE <--> ASR
+    PARENT <--> LLM
+    PIPELINE <--> TTS
+    TASKS -.start_task: accepted + task_id.-> RUNTIME
+    RUNTIME -.progress / completed / failed.-> TASKS
+
+    NOTE1[业务后端不转发实时音频]
+    NOTE2[子智能体不直接发声]
+    NOTE3[手机端和模型不能提交可信权限]
+    SIGNAL --- NOTE1
+    SEARCH --- NOTE2
+    CONTEXT --- NOTE3
+
+    classDef plan fill:#f1f3f5,stroke:#868e96,color:#343a40;
+    classDef algo fill:#e7f5ff,stroke:#1971c2,color:#0b2740;
+    classDef parent fill:#ebfbee,stroke:#2b8a3e,color:#163d1d;
+    classDef task fill:#fff4e6,stroke:#e8590c,color:#5f2c00;
+    class MIC,RTC,PLAY,AUTH,CONTEXT,SESSION,SIGNAL plan;
+    class TRANSPORT,PIPELINE,VAD,ASR,TTS algo;
+    class PARENT,LLM parent;
+    class TASKS,RUNTIME,REGISTRY,SEARCH,FUTURE task;
