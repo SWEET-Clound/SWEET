@@ -14,3 +14,18 @@ def test_grade_detect():
     assert grade_detect(-5) == None
     assert grade_detect(0) == "C"
 
+# 三段式
+def test_grade_detect1():
+    # Arrange
+    score = 60
+    # Act
+    result = grade_detect(score)
+    # Assert
+    assert result == "C"
+
+# 单元/集成/端到端测试
+# 单元：一个函数/一个节点
+# 集成：测试几个部分是否能对接得上 是否是通的
+# 端到端：真实输入到真实输出
+
+# mock是用来隔离不可控的边界
