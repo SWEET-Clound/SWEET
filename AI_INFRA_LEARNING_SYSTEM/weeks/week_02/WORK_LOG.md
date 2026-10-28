@@ -13,16 +13,16 @@
 
 ## W2-1 代码地图
 
-| 位置 | 作用 | 导入时执行？ | 外部依赖？ | 我的解释 |
-| --- | --- | --- | --- | --- |
-| `os.getenv` |  |  |  |  |
-| `init_chat_model` |  |  |  |  |
-| `calculator` |  |  |  |  |
-| `search_local_knowledge` |  |  |  |  |
-| `router_node` |  |  |  |  |
-| `route_by_task_type` |  |  |  |  |
-| `builder.compile` |  |  |  |  |
-| `run_agent` |  |  |  |  |
+| 位置 | 作用               | 导入时执行？                                            | 外部依赖？ | 我的解释          |
+| --- |------------------|---------------------------------------------------|-------|---------------|
+| `os.getenv` | 获取环境变量           | import os     | 不是    | python安装自带的模块 |
+| `init_chat_model` | 初始模型配置           | from langchain.chat_models import init_chat_model | 是     | 从模块中导入函数      |
+| `calculator` | 计算器工具            | from study_assistant import  calculator   | 不是    | 从模块中导入方法      |
+| `search_local_knowledge` | 本地资料检索工具         |  from study_assistant import search_local_knowledge | 不是    | 从模块中导入方法      |
+| `router_node` | 节点方法             |   from study_assistant import router_node          | 不是    | 从模块中导入函数      |
+| `route_by_task_type` | 路由函数             |    from study_assistant import route_by_task_type  | 不是    | 从模块中导入函数      |
+| `builder.compile` | StateGraph模块下的方法 |    from langgraph.graph import StateGraph          |       |               |
+| `run_agent` | 运行智能体  |   from study_assistant import run_agent    | 不是    | 是模块中的方法       |
 
 我预测的首个失败点：
 
