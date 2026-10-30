@@ -1,0 +1,79 @@
+x-memory-env: &memory-env
+  MEMORY_ENVIRONMENT: development
+  MEMORY_JWT_ISSUER: persistent-memory-dev
+  MEMORY_JWT_AUDIENCE: persistent-memory
+  MEMORY_DEV_JWT_SECRET: development-only-secret-change-before-sharing-1234
+  MEMORY_EXTRACTION_MODE: heuristic
+
+services:
+  db:
+    image: postgres:16.15-bookworm
+    environment:
+      POSTGRES_DB: memory
+      POSTGRES_USER: memory
+      POSTGRES_PASSWORD: memory-owner-local
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - memory_db:/var/lib/postgresql/data
+      - ./deploy/postgres/init.sql:/docker-entrypoint-initdb.d/001-roles.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memory -d memory"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      <<: *memory-env
+      MEMORY_DATABASE_URL: postgresql+psycopg://memory:memory-owner-local@db:5432/memory
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    command: ["memory-api"]
+    environment:
+      <<: *memory-env
+      MEMORY_DATABASE_URL: postgresql+psycopg://memory_app:memory-app-local@db:5432/memory
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready')",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  worker:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    command: ["memory-worker"]
+    environment:
+      <<: *memory-env
+      MEMORY_DATABASE_URL: postgresql+psycopg://memory_worker:memory-worker-local@db:5432/memory
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  memory_db:
+
