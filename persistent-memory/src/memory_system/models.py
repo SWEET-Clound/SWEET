@@ -85,6 +85,8 @@ class MemoryContextItem(BaseModel):
     valid_to: datetime | None
     confidence: float
     source_event_ids: list[str]
+    conflict_memory_ids: list[str] = Field(default_factory=list)
+    query_matched: bool = Field(default=False, exclude=True)
 
 
 class MemoryContext(BaseModel):
@@ -92,6 +94,24 @@ class MemoryContext(BaseModel):
     rendered_text: str
     truncated: bool
     diagnostics_id: str
+
+
+class ProfileProjection(BaseModel):
+    items: list[MemoryContextItem]
+    rendered_text: str
+    truncated: bool
+    diagnostics_id: str
+    as_of: datetime
+
+
+class RecallDiagnostic(BaseModel):
+    diagnostics_id: str
+    purpose: Literal["conversation", "task", "history", "support"]
+    token_budget: int
+    candidate_count: int
+    selected_memory_ids: list[str]
+    truncated: bool
+    created_at: datetime
 
 
 class RecordReceipt(BaseModel):
@@ -111,7 +131,7 @@ class EventProcessingStatus(BaseModel):
 
 class CommandReceipt(BaseModel):
     command_id: str
-    status: Literal["completed", "needs_confirmation", "deletion_pending"]
+    status: Literal["completed", "deletion_pending"]
     affected_memory_ids: list[str]
     deletion_job_id: str | None = None
 
@@ -121,7 +141,7 @@ class MemoryListQuery(BaseModel):
     layers: list[MemoryLayer] = Field(default_factory=list)
     statuses: list[str] = Field(default_factory=lambda: ["active"])
     cursor: str | None = None
-    limit: int = Field(default=50, ge=1, le=100)
+    limit: int = Field(default=50, ge=1, le=101)
 
 
 class MemorySummary(BaseModel):
@@ -138,6 +158,10 @@ class MemorySummary(BaseModel):
     future_utility: str | None = None
     affect: AffectSignal | None = None
     policy_version: str | None = None
+    subject_key: str | None = None
+    sensitivity: Literal["low", "medium", "high", "secret"] = "low"
+    poisoning_flags: list[str] = Field(default_factory=list)
+    conflict_memory_ids: list[str] = Field(default_factory=list)
 
 
 class AffectSignal(BaseModel):
@@ -162,8 +186,30 @@ class MemoryCandidate(BaseModel):
     future_utility: Literal["low", "medium", "high"]
     durability: Literal["transient", "uncertain", "stable"]
     affect: AffectSignal | None
-    sensitivity: str
+    sensitivity: Literal["low", "medium", "high", "secret"]
     poisoning_flags: list[str]
+
+
+class CandidateDecision(BaseModel):
+    candidate: MemoryCandidate
+    outcome: Literal["stored", "quarantined", "rejected"]
+    reason: str
+
+
+class CandidateDecisionAudit(BaseModel):
+    decision_id: str
+    event_id: str
+    candidate_ordinal: int
+    kind: str
+    proposed_layer: MemoryLayer
+    subject_key: str | None
+    sensitivity: Literal["low", "medium", "high", "secret"]
+    poisoning_flags: list[str]
+    outcome: Literal["stored", "quarantined", "rejected"]
+    reason: str
+    policy_version: str
+    stored_memory_id: str | None
+    created_at: datetime
 
 
 class RememberCommand(BaseModel):
@@ -173,8 +219,23 @@ class RememberCommand(BaseModel):
     source_event_id: str
 
 
+class RememberProcedureCommand(BaseModel):
+    action: Literal["remember_procedure"]
+    scope: MemoryScope
+    statement: str = Field(min_length=1, max_length=10_000)
+    source_event_id: str
+
+
 class CorrectCommand(BaseModel):
     action: Literal["correct"]
+    scope: MemoryScope
+    memory_id: str
+    replacement: str = Field(min_length=1, max_length=10_000)
+    source_event_id: str
+
+
+class CorrectProcedureCommand(BaseModel):
+    action: Literal["correct_procedure"]
     scope: MemoryScope
     memory_id: str
     replacement: str = Field(min_length=1, max_length=10_000)
@@ -194,7 +255,12 @@ class DoNotRememberCommand(BaseModel):
 
 
 MemoryCommand = Annotated[
-    RememberCommand | CorrectCommand | ForgetCommand | DoNotRememberCommand,
+    RememberCommand
+    | RememberProcedureCommand
+    | CorrectCommand
+    | CorrectProcedureCommand
+    | ForgetCommand
+    | DoNotRememberCommand,
     Field(discriminator="action"),
 ]
 
@@ -233,8 +299,21 @@ class RememberRequest(BaseModel):
     source_event_id: str
 
 
+class RememberProcedureRequest(BaseModel):
+    action: Literal["remember_procedure"]
+    statement: str = Field(min_length=1, max_length=10_000)
+    source_event_id: str
+
+
 class CorrectRequest(BaseModel):
     action: Literal["correct"]
+    memory_id: str
+    replacement: str = Field(min_length=1, max_length=10_000)
+    source_event_id: str
+
+
+class CorrectProcedureRequest(BaseModel):
+    action: Literal["correct_procedure"]
     memory_id: str
     replacement: str = Field(min_length=1, max_length=10_000)
     source_event_id: str
@@ -251,7 +330,12 @@ class DoNotRememberRequest(BaseModel):
 
 
 CommandRequest = Annotated[
-    RememberRequest | CorrectRequest | ForgetRequest | DoNotRememberRequest,
+    RememberRequest
+    | RememberProcedureRequest
+    | CorrectRequest
+    | CorrectProcedureRequest
+    | ForgetRequest
+    | DoNotRememberRequest,
     Field(discriminator="action"),
 ]
 
@@ -263,6 +347,22 @@ class DeletionStatus(BaseModel):
     error_code: str | None
     created_at: datetime
     completed_at: datetime | None
+
+
+class AuditEntry(BaseModel):
+    audit_id: str
+    action: str
+    target_id: str
+    created_at: datetime
+
+
+class MemoryReviewRequest(BaseModel):
+    decision: Literal["approve", "reject"]
+
+
+class MemoryReviewReceipt(BaseModel):
+    memory_id: str
+    status: Literal["active", "rejected"]
 
 
 class EventJob(BaseModel):

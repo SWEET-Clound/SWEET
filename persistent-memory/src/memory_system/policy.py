@@ -3,6 +3,17 @@ from dataclasses import dataclass
 
 from memory_system.models import EventSource, InteractionEvent, MemoryCandidate, MemoryLayer
 
+_OPT_OUT = re.compile(r"^\s*(?:请|麻烦)?\s*(?:你)?\s*(?:不要|别)\s*(?:记住|记录|保存)")
+REMEMBER_PREFIX = re.compile(r"^\s*(?:请|麻烦)?\s*(?:你)?\s*记住\s*[：:]?\s*(?P<fact>\S.*)$")
+
+
+def explicitly_opts_out(event: InteractionEvent) -> bool:
+    return is_memory_opt_out(event.source, event.content)
+
+
+def is_memory_opt_out(source: str, content: str) -> bool:
+    return source == EventSource.USER and bool(_OPT_OUT.match(content))
+
 _SECRET_PATTERNS = (
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     re.compile(
@@ -56,7 +67,7 @@ class MemoryPolicy:
         ):
             return WriteDecision(False, "semantic_memory_requires_stable_evidence")
         if candidate.proposed_layer is MemoryLayer.SEMANTIC and (
-            event is None or "记住" not in event.content
+            event is None or not REMEMBER_PREFIX.match(event.content)
         ):
             return WriteDecision(False, "semantic_memory_requires_explicit_consent")
         if candidate.proposed_layer is MemoryLayer.PROCEDURAL:

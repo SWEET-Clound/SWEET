@@ -1,12 +1,84 @@
+import json
 from datetime import UTC, datetime, timedelta
+from email.message import Message
+from io import BytesIO
+from urllib.request import HTTPSHandler
+from urllib.response import addinfourl
 
 import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import HTTPException
 
 from memory_system.api import JwtAuthenticator
 from memory_system.dev import issue_dev_token
 from memory_system.settings import Settings
+
+
+@pytest.mark.parametrize("url", ["http://issuer.test/jwks", "https:///jwks"])
+def test_production_rejects_insecure_or_hostless_jwks_url(url: str) -> None:
+    with pytest.raises(ValueError, match="production JWKS URL must use HTTPS"):
+        JwtAuthenticator("issuer", "memory-api", url)
+
+
+@pytest.mark.parametrize("location", ["http://issuer.test/keys", "https://other.test/keys"])
+def test_jwks_transport_rejects_redirects(monkeypatch, location: str) -> None:
+    url = "https://issuer.test/jwks"
+
+    def redirect(_handler, request):
+        assert request.full_url == url
+        headers = Message()
+        headers["Location"] = location
+        response = addinfourl(BytesIO(b""), headers, url, 302)
+        response.msg = "Found"
+        return response
+
+    monkeypatch.setattr(HTTPSHandler, "https_open", redirect)
+    authenticator = JwtAuthenticator("issuer", "memory-api", url)
+    assert authenticator.jwks is not None
+    with pytest.raises(jwt.exceptions.PyJWKClientConnectionError, match="302"):
+        authenticator.jwks.fetch_data()
+
+
+@pytest.mark.asyncio
+async def test_production_jwks_verifies_signature_and_audience(monkeypatch) -> None:
+    trusted = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    untrusted = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(trusted.public_key()))
+    jwk.update(kid="memory-key", use="sig", alg="RS256")
+    authenticator = JwtAuthenticator(
+        issuer="memory-issuer", audience="memory-api", jwks_url="https://issuer.test/jwks"
+    )
+    assert authenticator.jwks is not None
+    monkeypatch.setattr(authenticator.jwks, "fetch_data", lambda: {"keys": [jwk]})
+    claims = {
+        "iss": "memory-issuer",
+        "aud": "memory-api",
+        "exp": datetime.now(UTC) + timedelta(minutes=5),
+        "tenant_id": "tenant-a",
+        "user_id": "user-a",
+        "agent_id": "agent-a",
+    }
+
+    def token(key, **overrides):
+        return jwt.encode(claims | overrides, key, algorithm="RS256", headers={"kid": "memory-key"})
+
+    assert (await authenticator.authenticate_token(token(trusted))).user_id == "user-a"
+    for invalid in (token(untrusted), token(trusted, aud="different-api")):
+        with pytest.raises(HTTPException) as exc:
+            await authenticator.authenticate_token(invalid)
+        assert exc.value.status_code == 401
+
+    def unavailable():
+        raise jwt.exceptions.PyJWKClientConnectionError("test connection failure")
+
+    assert authenticator.jwks.jwk_set_cache is not None
+    authenticator.jwks.jwk_set_cache.put(None)
+    monkeypatch.setattr(authenticator.jwks, "fetch_data", unavailable)
+    with pytest.raises(HTTPException) as exc:
+        await authenticator.authenticate_token(token(trusted))
+    assert exc.value.status_code == 503
+    assert exc.value.detail == "jwks_unavailable"
 
 
 @pytest.mark.asyncio
@@ -32,7 +104,14 @@ async def test_development_token_is_usable_but_cannot_be_enabled_in_production()
     identity = await authenticator.authenticate_token(token)
 
     assert identity.tenant_id == "tenant-a"
-    assert identity.allowed_purposes == {"conversation", "task", "history", "support"}
+    assert identity.allowed_purposes == {
+        "conversation",
+        "task",
+        "history",
+        "support",
+        "review",
+        "audit",
+    }
     assert identity.memory_write is True
 
     with pytest.raises(ValueError, match="development JWT secret"):

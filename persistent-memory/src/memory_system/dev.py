@@ -1,12 +1,27 @@
 import argparse
 import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import uuid4
 
 import httpx
 import jwt
+import psycopg
+from alembic import command
+from alembic.config import Config
 
 from memory_system.settings import Settings
+
+
+def migrate_main() -> None:
+    package_migrations = Path(__file__).with_name("migrations")
+    source_migrations = Path(__file__).resolve().parents[2] / "migrations"
+    migrations = package_migrations if package_migrations.is_dir() else source_migrations
+    if not migrations.is_dir():
+        raise RuntimeError("packaged Alembic migrations are missing")
+    config = Config()
+    config.set_main_option("script_location", str(migrations))
+    command.upgrade(config, "head")
 
 
 def issue_dev_token(
@@ -28,7 +43,14 @@ def issue_dev_token(
             "tenant_id": tenant_id,
             "user_id": user_id,
             "agent_id": agent_id,
-            "memory_purposes": ["conversation", "task", "history", "support"],
+            "memory_purposes": [
+                "conversation",
+                "task",
+                "history",
+                "support",
+                "review",
+                "audit",
+            ],
             "memory_write": True,
         },
         settings.dev_jwt_secret.get_secret_value(),
@@ -53,6 +75,33 @@ def token_main() -> None:
             lifetime_minutes=args.minutes,
         )
     )
+
+
+def worker_health_main() -> None:
+    settings = Settings()  # type: ignore[call-arg]
+    if settings.worker_database_url is None:
+        raise RuntimeError("MEMORY_WORKER_DATABASE_URL is required")
+    check_worker_database(settings.worker_database_url.get_secret_value())
+
+
+def check_worker_database(database_url: str) -> None:
+    dsn = database_url.replace(
+        "postgresql+psycopg://", "postgresql://", 1
+    )
+    with psycopg.connect(dsn, connect_timeout=3) as connection:
+        role = connection.execute(
+            "SELECT rolbypassrls FROM pg_roles WHERE rolname=current_user"
+        ).fetchone()
+        if role is None or not role[0]:
+            raise RuntimeError("memory worker requires a database role with BYPASSRLS")
+        connection.execute(
+            """
+            SELECT 1 FROM memory_outbox, deletion_job, memory_event, memory_item,
+                          memory_candidate_decision, memory_recall_diagnostic,
+                          memory_write_rate_limit
+            LIMIT 0
+            """
+        )
 
 
 def smoke_main() -> None:

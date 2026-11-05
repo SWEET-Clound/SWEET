@@ -12,7 +12,11 @@ from memory_system.system import MemorySystem
 
 def create_application() -> FastAPI:
     settings = Settings()  # type: ignore[call-arg]
-    repository = PostgresRepository.from_url(settings.database_url.get_secret_value())
+    repository = PostgresRepository.from_url(
+        settings.database_url.get_secret_value(),
+        event_write_limit_per_minute=settings.event_write_limit_per_minute,
+        command_write_limit_per_minute=settings.command_write_limit_per_minute,
+    )
     system = MemorySystem(repository, MemoryPolicy(), settings.max_context_tokens)
     authenticate = JwtAuthenticator(
         issuer=settings.jwt_issuer,

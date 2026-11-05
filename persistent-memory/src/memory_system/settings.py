@@ -22,11 +22,15 @@ class Settings(BaseSettings):
     model_base_url: str | None = None
     model_api_key: SecretStr | None = None
     extraction_model: str | None = None
+    model_timeout_seconds: float = Field(default=30, ge=1, le=300)
+    model_max_attempts: int = Field(default=2, ge=1, le=3)
     embedding_model: str | None = None
     rerank_model: str | None = None
     raw_event_retention_days: int = Field(default=30, ge=1)
     working_memory_ttl_hours: int = Field(default=72, ge=1)
     max_context_tokens: int = Field(default=2048, ge=256, le=4096)
+    event_write_limit_per_minute: int = Field(default=120, ge=1, le=100_000)
+    command_write_limit_per_minute: int = Field(default=30, ge=1, le=100_000)
     worker_concurrency: int = Field(default=4, ge=1, le=64)
     worker_poll_seconds: float = Field(default=1.0, ge=0.1, le=60)
 

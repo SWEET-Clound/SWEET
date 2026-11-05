@@ -4,10 +4,12 @@ x-memory-env: &memory-env
   MEMORY_JWT_AUDIENCE: persistent-memory
   MEMORY_DEV_JWT_SECRET: development-only-secret-change-before-sharing-1234
   MEMORY_EXTRACTION_MODE: heuristic
+  MEMORY_EVENT_WRITE_LIMIT_PER_MINUTE: 120
+  MEMORY_COMMAND_WRITE_LIMIT_PER_MINUTE: 30
 
 services:
   db:
-    image: postgres:16.15-bookworm
+    image: pgvector/pgvector:0.8.7-pg16-bookworm
     environment:
       POSTGRES_DB: memory
       POSTGRES_USER: memory
@@ -27,7 +29,7 @@ services:
     build:
       context: .
       dockerfile: deploy/Dockerfile
-    command: ["alembic", "upgrade", "head"]
+    command: ["memory-migrate"]
     environment:
       <<: *memory-env
       MEMORY_DATABASE_URL: postgresql+psycopg://memory:memory-owner-local@db:5432/memory
@@ -69,9 +71,16 @@ services:
     environment:
       <<: *memory-env
       MEMORY_DATABASE_URL: postgresql+psycopg://memory_worker:memory-worker-local@db:5432/memory
+      MEMORY_WORKER_DATABASE_URL: postgresql+psycopg://memory_worker:memory-worker-local@db:5432/memory
     depends_on:
       migrate:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "memory-worker-health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    stop_grace_period: 45s
     restart: unless-stopped
 
 volumes:
