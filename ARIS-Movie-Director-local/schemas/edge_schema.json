@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wanshuiyin/ARIS-Movie-Director/schemas/edge_schema.json",
+  "title": "ARIS-Movie-Director Wiki Edge",
+  "description": "Schema for every line in wiki/edges.jsonl (one JSON object per line). The executable convention (engine writeWiki + cli/validate_wiki.py + the generated edges.jsonl) is src/dst/type — this schema documents that reality, not the legacy video-pipeline from/to/edge_type form.",
+  "type": "object",
+  "required": [
+    "src",
+    "dst",
+    "type"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "src": {
+      "type": "string",
+      "description": "source node_id (e.g. 'review:panel_s10_a01_codex')"
+    },
+    "dst": {
+      "type": "string",
+      "description": "target node_id (e.g. 'attempt:s10_a01')"
+    },
+    "type": {
+      "enum": [
+        "attempt_of",
+        "reviews",
+        "decides",
+        "failure_of",
+        "rollback_of",
+        "supersedes",
+        "derived_from",
+        "plans_asset",
+        "uses_asset",
+        "uses_style_anchor",
+        "uses_blueprint",
+        "uses_motif_ledger",
+        "produced_by_image2",
+        "reviewed_by",
+        "violates_continuity",
+        "anchors_continuity"
+      ],
+      "description": "the EXACT edge vocabulary cli/validate_wiki.py enforces (kept in sync with its EDGE_TYPES). RUNTIME: attempt_of (attempt->panel), reviews (review->target), decides (decision->target), failure_of (failure_mode->target), rollback_of / supersedes (cross-frame repair links). AUTHOR-LAYER: derived_from, plans_asset, uses_asset, uses_style_anchor, uses_blueprint, uses_motif_ledger, produced_by_image2, reviewed_by, violates_continuity, anchors_continuity."
+    },
+    "reviewer": {
+      "enum": ["cc", "codex", "gemini", "system", "user"],
+      "description": "OPTIONAL - on a 'reviews' edge, which reviewer produced it"
+    },
+    "verdict": {
+      "type": "string",
+      "description": "OPTIONAL - on a 'decides' edge, the verdict (keep | retry_panel | rollback | accept_by_human)"
+    },
+    "evidence": {
+      "type": "string",
+      "description": "OPTIONAL - free-text justification (e.g. a quoted reviewer line)"
+    },
+    "weight": {
+      "type": "number",
+      "description": "OPTIONAL - confidence in [0,1] or a rubric score"
+    },
+    "created_at": {
+      "type": "string",
+      "description": "OPTIONAL - logical order tag, NOT wall-clock (Date.now() is unavailable in the generation sandbox)"
+    }
+  }
+}

@@ -1,0 +1,1555 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="《雪夜山庄》——十页竖屏互动推理漫画。">
+<title>雪夜山庄｜互动推理漫画</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700&family=ZCOOL+XiaoWei&family=Zhi+Mang+Xing&display=swap">
+<style>
+/* Layout: a dark press table; each page is a 9:16 paper strip, snap-scrolled vertically; UI floats off the strip. Single deliberate dark look. */
+:root{
+  --table:#0b0a09;        /* the press table behind the strips */
+  --paper:#e9e2d0;        /* aged paper */
+  --gutter:#fbf8f1;       /* pure white panel gaps */
+  --ink:#141210;          /* print ink */
+  --ink-2:#3b3630;
+  --blood:#6e1212;        /* the only accent */
+  --glow:#f3e3b0;         /* lamp light / hover glow */
+  --ui:#d6cdb8;
+  --ui-dim:#8a8274;
+  --ui-line:rgba(214,205,184,.18);
+  --display:'ZCOOL XiaoWei','Songti SC','STSong','SimSun',serif;
+  --body:'Noto Serif SC','Songti SC','STSong','SimSun',serif;
+  --carve:'Zhi Mang Xing','Ma Shan Zheng','KaiTi','STKaiti',cursive;
+  --sh:min(100dvh, 177.78vw);          /* sheet height, refined by script */
+  --u:calc(var(--sh) / 1920);          /* one design unit (1080×1920 grid) */
+  --cursor-mag:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32'><circle cx='13' cy='13' r='9' fill='none' stroke='%23f3e3b0' stroke-width='2.5'/><line x1='20' y1='20' x2='30' y2='30' stroke='%23f3e3b0' stroke-width='3' stroke-linecap='round'/></svg>") 13 13, zoom-in;
+  color-scheme:dark;
+}
+html{height:100%;box-sizing:border-box}
+*,*::before,*::after{box-sizing:inherit}
+body{
+  height:100%;margin:0;
+  padding-block:0;
+  padding-left:max(16px, env(safe-area-inset-left, 0px));
+  padding-right:max(16px, env(safe-area-inset-right, 0px));
+  background:var(--table);color:var(--ui);
+  font-family:var(--body);font-size:14px;line-height:1.6;
+  overflow:hidden;
+}
+body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top,0px);z-index:10;background:var(--table)}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+button:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--glow);outline-offset:2px}
+
+/* ---------- stage & pages ---------- */
+#stage{height:100%;overflow-y:auto;overflow-x:hidden;scroll-snap-type:y mandatory;scrollbar-width:none;position:relative}
+#stage::-webkit-scrollbar{display:none}
+#stage.shake{animation:shake .32s linear}
+@keyframes shake{0%,100%{transform:translate(0,0)}20%{transform:translate(0,calc(-9*var(--u)))}45%{transform:translate(0,calc(6*var(--u)))}70%{transform:translate(0,calc(-3*var(--u)))}}
+.page{height:100%;scroll-snap-align:start;scroll-snap-stop:always;display:grid;place-items:center}
+.sheet{
+  position:relative;width:calc(1080*var(--u));height:calc(1920*var(--u));
+  background:var(--gutter);color:var(--ink);
+  box-shadow:0 0 0 1px rgba(0,0,0,.6), 0 40px 80px -30px rgba(0,0,0,.9);
+  overflow:hidden;user-select:none;
+}
+.panels{display:flex;flex-direction:column;gap:calc(22*var(--u));height:100%}
+.panels>.panel,.row{flex:0 0 calc(var(--h)*var(--u))}
+.row{display:flex;gap:calc(22*var(--u));padding-inline:calc(40*var(--u));min-height:0}
+.row.flush{padding-inline:0}
+.row>.panel{flex:1 1 0;height:100%;min-width:0}
+.panel{position:relative;overflow:hidden;margin:0;background:var(--ink)}
+.panel>svg{position:absolute;inset:0;width:100%;height:100%;display:block;transition:transform .55s cubic-bezier(.2,.75,.2,1);transform-origin:50% 50%}
+.panel.pushed>svg{transform:scale(1.08)}
+/* generated art replaces the storyboard: 1080×2060 with 70px bleed top and bottom */
+.sheet .art{position:absolute;left:0;top:calc(-70*var(--u));width:100%;height:calc(2060*var(--u));max-width:none;object-fit:cover;display:none;pointer-events:none}
+.sheet.has-art .art{display:block}
+.sheet.has-art .panels{visibility:hidden}
+body.show-board .sheet.has-art .art{display:none}
+body.show-board .sheet.has-art .panels{visibility:visible}
+/* Keep the accusation controls interactive when the final page has replacement art. */
+#p5 .sheet.has-art .suspect{visibility:visible;z-index:2}
+
+/* ---------- lettering ---------- */
+.say{
+  position:absolute;writing-mode:vertical-rl;text-orientation:upright;
+  font-family:var(--body);font-size:calc(30*var(--u));line-height:1.35;letter-spacing:.08em;
+  background:var(--gutter);color:var(--ink);border:calc(4*var(--u)) solid var(--ink);
+  padding:calc(22*var(--u)) calc(14*var(--u));box-shadow:calc(6*var(--u)) calc(6*var(--u)) 0 var(--ink);
+  pointer-events:none;z-index:3;max-height:calc(520*var(--u));
+}
+.say::after{content:"";position:absolute;width:calc(22*var(--u));height:calc(22*var(--u));background:var(--gutter);border:calc(4*var(--u)) solid var(--ink);border-top:0;border-left:0;transform:rotate(45deg);bottom:calc(-15*var(--u));left:45%}
+.say.tail-left::after{left:auto;right:calc(-15*var(--u));bottom:40%;transform:rotate(-45deg)}
+.say.tail-none::after{display:none}
+.sfx{
+  position:absolute;font-family:var(--carve);font-size:calc(150*var(--u));line-height:1;color:var(--ink);
+  -webkit-text-stroke:calc(3*var(--u)) var(--gutter);paint-order:stroke fill;
+  pointer-events:none;z-index:3;white-space:nowrap;
+}
+.sfx.light{color:var(--paper);-webkit-text-stroke:calc(3*var(--u)) var(--ink)}
+.sfx.vert{writing-mode:vertical-rl;text-orientation:upright}
+
+/* ---------- hotspots ---------- */
+.hot{position:absolute;z-index:4;cursor:var(--cursor-mag);border-radius:2px;background:transparent}
+.hot::before{content:"";position:absolute;inset:0;border:calc(3*var(--u)) solid var(--glow);border-radius:inherit;opacity:0;box-shadow:0 0 calc(24*var(--u)) var(--glow), inset 0 0 calc(24*var(--u)) rgba(243,227,176,.35);transition:opacity .25s}
+.hot:hover::before,.hot:focus-visible::before{opacity:1}
+.hot.main::after{content:"";position:absolute;inset:0;border:calc(2*var(--u)) solid var(--glow);border-radius:inherit;opacity:0;animation:beacon 5s ease-in-out infinite 2s;pointer-events:none}
+@keyframes beacon{0%,70%,100%{opacity:0}78%{opacity:.55}86%{opacity:0}}
+.hot.found::before{opacity:.3;border-color:var(--blood);box-shadow:0 0 calc(18*var(--u)) rgba(110,18,18,.7),inset 0 0 calc(18*var(--u)) rgba(110,18,18,.28)}
+.hot.found.main::after{animation:none}
+body.show-hot .hot{outline:1px dashed rgba(110,18,18,.9);outline-offset:-1px;background:rgba(110,18,18,.12)}
+body.show-hot .hot::after{content:attr(aria-label);position:absolute;left:0;top:100%;font:calc(22*var(--u))/1.2 var(--display);color:var(--blood);background:var(--gutter);padding:2px 6px;border:0;opacity:1;animation:none}
+
+/* P5 suspects: the panels themselves are the choice */
+.panel.suspect{cursor:var(--cursor-mag);transition:flex .8s cubic-bezier(.2,.8,.2,1),filter .8s}
+.panel.suspect::after{content:"";position:absolute;inset:0;border:calc(3*var(--u)) solid var(--glow);opacity:0;box-shadow:0 0 calc(24*var(--u)) var(--glow), inset 0 0 calc(24*var(--u)) rgba(243,227,176,.3);transition:opacity .25s;pointer-events:none}
+.panel.suspect:hover::after,.panel.suspect:focus-visible::after{opacity:1}
+.suspect .tag{position:absolute;right:calc(18*var(--u));bottom:calc(18*var(--u));writing-mode:vertical-rl;text-orientation:upright;font-family:var(--display);font-size:calc(34*var(--u));letter-spacing:.2em;color:var(--paper);text-shadow:0 0 calc(10*var(--u)) #000;z-index:2}
+.suspect .verdict{position:absolute;inset:calc(40*var(--u)) calc(40*var(--u)) calc(40*var(--u)) auto;writing-mode:vertical-rl;text-orientation:upright;font-family:var(--body);font-size:calc(28*var(--u));line-height:1.5;letter-spacing:.06em;color:var(--paper);background:rgba(11,10,9,.78);border:calc(3*var(--u)) solid var(--paper);padding:calc(26*var(--u)) calc(18*var(--u));opacity:0;transform:translateX(calc(30*var(--u)));transition:opacity .6s .5s,transform .6s .5s;pointer-events:none;z-index:2;max-width:70%}
+.suspect .verdict b{color:var(--glow);font-weight:400}
+.suspect .verdict .guilty{color:#d9a7a7}
+.sheet.accused .suspect{flex:.42;filter:brightness(.32) contrast(1.3)}
+.sheet.accused .suspect.chosen{flex:3.2;filter:none}
+.sheet.accused .suspect.chosen .verdict{opacity:1;transform:none}
+.sheet.accused .suspect:not(.chosen) .tag{opacity:.5}
+.sheet.accused .suspect::after{display:none}
+
+/* ---------- fixed layers ---------- */
+#snow,#fx{position:fixed;inset:0;width:100%;height:100%;pointer-events:none}
+#snow{z-index:5;mix-blend-mode:screen;opacity:.85}
+#fx{z-index:7;opacity:0;transition:opacity .2s}
+#fx.on{opacity:1}
+#grain{position:fixed;inset:0;z-index:6;pointer-events:none;mix-blend-mode:multiply;opacity:.55;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='300' height='300'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 .78 0 0 0 0 .74 0 0 0 0 .66 0 0 0 .55 0'/></filter><rect width='300' height='300' filter='url(%23n)'/></svg>");
+  background-size:300px 300px}
+
+/* ---------- HUD ---------- */
+.hud{position:fixed;z-index:8;left:0;right:0;pointer-events:none;
+  padding-left:max(16px, env(safe-area-inset-left, 0px));padding-right:max(16px, env(safe-area-inset-right, 0px))}
+.hud>*{pointer-events:auto}
+.hud.top{top:env(safe-area-inset-top,0px);display:flex;align-items:center;justify-content:space-between;gap:12px;padding-block:10px}
+.hud.bottom{bottom:env(safe-area-inset-bottom,0px);display:flex;align-items:flex-end;justify-content:space-between;gap:12px;padding-block:12px}
+.brand{display:flex;align-items:baseline;gap:10px;background:rgba(11,10,9,.72);padding:6px 10px;border:1px solid var(--ui-line)}
+.brand h1{margin:0;font:400 20px/1 var(--display);letter-spacing:.3em;color:var(--paper)}
+.brand small{font-size:11px;letter-spacing:.14em;color:var(--ui-dim)}
+.tools{display:flex;gap:6px}
+.clue-progress{display:flex;align-items:center;gap:.35em;font-family:var(--display);font-size:13px;letter-spacing:.14em;padding:7px 11px;border:1px solid var(--ui-line);background:rgba(11,10,9,.72);color:var(--ui-dim)}
+.clue-progress b{font-weight:400;color:var(--glow)}
+.btn{font-family:var(--display);font-size:13px;letter-spacing:.14em;padding:7px 11px;border:1px solid var(--ui-line);background:rgba(11,10,9,.72);color:var(--ui);transition:border-color .2s,color .2s}
+.btn:hover{border-color:var(--glow);color:var(--glow)}
+.btn[aria-pressed="true"]{border-color:var(--glow);color:var(--glow)}
+.btn.blood{border-color:rgba(110,18,18,.8);color:#d9a7a7}
+.pageline{display:flex;align-items:center;gap:10px;background:rgba(11,10,9,.72);padding:6px 10px;border:1px solid var(--ui-line);font-family:var(--display);letter-spacing:.2em;font-size:13px}
+.pageline b{font-weight:400;color:var(--paper)}
+.pageline .dots{display:flex;gap:6px}
+.pageline .dots i{width:6px;height:6px;background:var(--ui-dim);display:block;transform:rotate(45deg);transition:background .3s}
+.pageline .dots i.on{background:var(--glow)}
+.hint{font-family:var(--display);font-size:12px;letter-spacing:.2em;color:var(--ui-dim);background:rgba(11,10,9,.72);padding:6px 10px;border:1px solid var(--ui-line);transition:opacity 1s}
+.hint.gone{opacity:0}
+.hint.good{color:var(--glow);border-color:rgba(243,227,176,.55)}
+.hint.bad{color:#d9a7a7;border-color:rgba(110,18,18,.8)}
+#redo{display:none}
+#redo.show{display:inline-block}
+.rail{position:fixed;right:max(10px, env(safe-area-inset-right, 0px));top:50%;transform:translateY(-50%);z-index:8;display:flex;flex-direction:column;gap:14px}
+.rail button{writing-mode:vertical-rl;text-orientation:upright;font-family:var(--display);font-size:12px;letter-spacing:.25em;color:var(--ui-dim);padding:6px 3px;border-left:1px solid var(--ui-line);transition:color .3s,border-color .3s}
+.rail button.on,.rail button:hover{color:var(--glow);border-color:var(--glow)}
+@media (max-width:720px){.rail{display:none}.brand small{display:none}.hint{display:none}}
+
+/* ---------- close-up dialog ---------- */
+dialog#closeup{border:0;padding:0;background:transparent;max-width:none;max-height:none;width:100%;height:100%;color:var(--ink)}
+dialog#closeup::backdrop{background:rgba(5,5,4,.86)}
+.cu-wrap{height:100%;display:grid;place-items:center;padding:4vh 16px}
+.cu-frame{position:relative;background:var(--paper);border:3px solid var(--ink);box-shadow:0 0 0 12px var(--gutter),0 0 0 13px var(--ink),0 40px 80px rgba(0,0,0,.8);width:min(560px, 92vw, 68vh);aspect-ratio:3/4;max-width:100%;overflow:hidden;animation:cuin .5s cubic-bezier(.2,.8,.2,1)}
+@keyframes cuin{from{transform:scale(.86);opacity:0}to{transform:none;opacity:1}}
+.cu-frame svg{position:absolute;inset:0;width:100%;height:100%;display:block}
+.cu-frame .cap{position:absolute;right:5%;top:6%;margin:0;writing-mode:vertical-rl;text-orientation:upright;font-family:var(--body);font-size:clamp(14px,2.2vh,20px);line-height:1.4;letter-spacing:.1em;background:var(--gutter);border:2px solid var(--ink);padding:14px 8px;box-shadow:4px 4px 0 var(--ink);max-height:80%}
+.cu-frame .cap.lo{top:auto;bottom:6%}
+.cu-frame .cap.left{right:auto;left:5%}
+.letter{position:absolute;inset:8%;background:var(--gutter);border:2px solid var(--ink);box-shadow:6px 6px 0 var(--ink);padding:6%;writing-mode:vertical-rl;text-orientation:upright;font-family:var(--carve);font-size:clamp(20px,3.4vh,32px);line-height:1.5;letter-spacing:.06em;color:var(--ink);display:flex;flex-direction:row-reverse;gap:1.2em}
+.letter .sig{align-self:flex-end;font-size:.8em;color:var(--ink-2)}
+.letter .seal{position:absolute;left:8%;bottom:8%;width:14%;aspect-ratio:1;border-radius:50%;background:var(--blood);box-shadow:inset 0 0 0 3px rgba(0,0,0,.25);transform:rotate(-12deg);writing-mode:horizontal-tb}
+.cu-title{position:absolute;left:0;top:0;transform:translateY(-130%);font-family:var(--display);letter-spacing:.3em;color:var(--ui);font-size:13px}
+.cu-close{position:absolute;right:8px;top:8px;z-index:4;background:#141210;font-family:var(--display);letter-spacing:.2em;color:var(--ui);font-size:13px;padding:4px 8px;border:1px solid var(--ui-line)}
+.cu-close:hover{color:var(--glow);border-color:var(--glow)}
+
+/* ---------- maker drawer ---------- */
+#maker{position:fixed;top:0;right:0;bottom:0;z-index:9;width:min(440px,100%);background:#131110;color:var(--ui);border-left:1px solid var(--ui-line);transform:translateX(102%);transition:transform .45s cubic-bezier(.2,.8,.2,1);overflow-y:auto;
+  padding-top:calc(env(safe-area-inset-top,0px) + 14px);padding-bottom:calc(env(safe-area-inset-bottom,0px) + 30px);
+  padding-left:16px;padding-right:max(16px, env(safe-area-inset-right, 0px));font-size:13px}
+#maker.open{transform:none}
+#maker h2{font:400 18px/1.2 var(--display);letter-spacing:.3em;color:var(--paper);margin:0 0 4px}
+#maker h3{font:400 13px/1.2 var(--display);letter-spacing:.3em;color:var(--glow);margin:26px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--ui-line)}
+#maker p{margin:0 0 8px;color:var(--ui-dim)}
+.mk-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:6px}
+.toggles{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.toggles .btn{text-align:left}
+.slot{display:grid;grid-template-columns:52px 1fr auto;gap:10px;align-items:center;padding:8px 0;border-bottom:1px dashed var(--ui-line)}
+.slot .thumb{width:52px;aspect-ratio:9/16;background:#0b0a09;border:1px solid var(--ui-line);object-fit:cover;display:block}
+.slot .thumb.empty{display:grid;place-items:center;font-family:var(--display);color:var(--ui-dim);font-size:11px;letter-spacing:.1em}
+.slot .name{font-family:var(--display);letter-spacing:.2em;color:var(--paper)}
+.slot .meta{color:var(--ui-dim);font-size:12px}
+.slot label.btn{display:inline-block}
+.slot input{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+.slot .acts{display:flex;flex-direction:column;gap:4px}
+.prompt{background:#0b0a09;border:1px solid var(--ui-line);padding:10px 12px;margin-bottom:10px;position:relative}
+.prompt .pt{font-family:var(--display);letter-spacing:.2em;color:var(--paper);margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+.prompt pre{margin:0;white-space:pre-wrap;word-break:break-word;font:12px/1.55 ui-monospace,Consolas,'Courier New',monospace;color:var(--ui);max-height:160px;overflow:auto}
+.prompt .cn{font-size:12px;color:var(--ui-dim);margin-top:6px}
+.copy{font-family:var(--display);font-size:11px;letter-spacing:.15em;padding:3px 8px;border:1px solid var(--ui-line);color:var(--ui-dim);white-space:nowrap}
+.copy:hover{color:var(--glow);border-color:var(--glow)}
+.copy.ok{color:var(--glow);border-color:var(--glow)}
+.drop-on{outline:3px dashed var(--glow);outline-offset:-3px}
+.toast{position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom,0px) + 70px);transform:translate(-50%,20px);z-index:11;background:var(--gutter);color:var(--ink);font-family:var(--display);letter-spacing:.2em;padding:8px 14px;border:2px solid var(--ink);box-shadow:4px 4px 0 var(--ink);opacity:0;transition:opacity .3s,transform .3s;pointer-events:none;font-size:13px}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+
+.rail{gap:4px}
+.rail button{writing-mode:horizontal-tb;padding:4px 10px;text-align:left;letter-spacing:.1em;background:#141210}
+.chase-caption{left:9%;top:10%;max-height:none;max-width:82%;writing-mode:horizontal-tb;font-size:calc(40*var(--u))}
+.beat-blood{stroke-dasharray:1;stroke-dashoffset:0}
+.page.is-reading .beat-rattle{animation:rattle .55s .32s ease-in-out}
+.page.is-reading .beat-blood{animation:seep 1.5s .65s both}
+.page.is-reading .beat-run{animation:flee 1.45s .28s both}
+.page.is-reading .beat-run.turn{animation:turn-away 1.6s .3s both}
+.page.is-reading .beat-lamp{animation:lamp-flicker .65s .45s 2}
+@keyframes rattle{20%,60%{transform:translateX(-17px)}40%,80%{transform:translateX(15px)}}
+@keyframes seep{from{stroke-dashoffset:1}to{stroke-dashoffset:0}}
+@keyframes flee{0%{transform:translate(-90px,130px)}75%{opacity:1}100%{transform:translate(370px,-70px) scale(.75);opacity:0}}
+@keyframes turn-away{0%{transform:translate(-35px,90px)}42%{transform:translate(35px,0)}62%{opacity:1}100%{transform:translate(420px,-110px);opacity:0}}
+@keyframes lamp-flicker{30%,65%{opacity:.18}}
+.chase-page .hot.main::after{animation-delay:1.8s}
+@media (prefers-reduced-motion:reduce){.page.is-reading :is(.beat-rattle,.beat-blood,.beat-run,.beat-lamp){animation:none}}
+@media (prefers-reduced-motion:reduce){
+  .panel>svg,.panel.suspect,.suspect .verdict{transition:none}
+  .hot.main::after{animation:none}
+  .cu-frame{animation:none}
+  #stage.shake{animation:none}
+}
+</style>
+</head>
+<body>
+
+<!-- ============ shared woodcut defs ============ -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <filter id="rough" x="-6%" y="-6%" width="112%" height="112%">
+      <feTurbulence type="fractalNoise" baseFrequency=".035" numOctaves="3" seed="7" result="n"/>
+      <feDisplacementMap in="SourceGraphic" in2="n" scale="7" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+    <filter id="rough2" x="-6%" y="-6%" width="112%" height="112%">
+      <feTurbulence type="fractalNoise" baseFrequency=".06" numOctaves="2" seed="3" result="n"/>
+      <feDisplacementMap in="SourceGraphic" in2="n" scale="4" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+    <radialGradient id="lampglow"><stop offset="0" stop-color="#f3e3b0" stop-opacity=".95"/><stop offset=".45" stop-color="#f3e3b0" stop-opacity=".35"/><stop offset="1" stop-color="#f3e3b0" stop-opacity="0"/></radialGradient>
+    <!-- dark tone, light knife lines -->
+    <pattern id="h1" width="9" height="9" patternUnits="userSpaceOnUse" patternTransform="rotate(35)"><rect width="9" height="9" fill="#141210"/><rect width="2.2" height="9" fill="#e9e2d0"/></pattern>
+    <!-- light tone, dark lines -->
+    <pattern id="h2" width="9" height="9" patternUnits="userSpaceOnUse" patternTransform="rotate(-40)"><rect width="9" height="9" fill="#e9e2d0"/><rect width="2.4" height="9" fill="#141210"/></pattern>
+    <pattern id="h3" width="14" height="14" patternUnits="userSpaceOnUse" patternTransform="rotate(40)"><rect width="14" height="14" fill="#e9e2d0" fill-opacity="0"/><rect width="1.8" height="14" fill="#141210"/></pattern>
+    <pattern id="hx" width="12" height="12" patternUnits="userSpaceOnUse"><rect width="12" height="12" fill="#2a2622"/><path d="M0 0L12 12M12 0L0 12" stroke="#e9e2d0" stroke-width="1.4"/></pattern>
+    <pattern id="dots" width="10" height="10" patternUnits="userSpaceOnUse"><rect width="10" height="10" fill="#cfc7b4"/><circle cx="5" cy="5" r="2.4" fill="#141210"/></pattern>
+    <pattern id="snowdots" width="64" height="64" patternUnits="userSpaceOnUse"><circle cx="10" cy="14" r="2" fill="#e9e2d0"/><circle cx="42" cy="40" r="1.5" fill="#e9e2d0"/><circle cx="54" cy="8" r="1.2" fill="#e9e2d0"/><circle cx="26" cy="52" r="1.1" fill="#e9e2d0"/></pattern>
+    <pattern id="snowfaint" width="70" height="70" patternUnits="userSpaceOnUse"><circle cx="12" cy="16" r="1.6" fill="#141210" fill-opacity=".35"/><circle cx="50" cy="44" r="1.2" fill="#141210" fill-opacity=".3"/><circle cx="60" cy="10" r="1" fill="#141210" fill-opacity=".3"/></pattern>
+    <pattern id="snowdense" width="90" height="90" patternUnits="userSpaceOnUse"><g fill="#fbf8f1"><circle cx="8" cy="12" r="3"/><circle cx="40" cy="30" r="2"/><circle cx="70" cy="8" r="4"/><circle cx="20" cy="60" r="2.5"/><circle cx="58" cy="70" r="3.5"/><circle cx="84" cy="48" r="2"/><circle cx="36" cy="84" r="1.8"/><circle cx="66" cy="40" r="1.5"/></g></pattern>
+    <pattern id="wood" width="18" height="120" patternUnits="userSpaceOnUse"><rect width="18" height="120" fill="#d8d0bc"/><path d="M4 0 C6 30 2 60 5 90 S4 110 4 120" stroke="#141210" stroke-width="1.6" fill="none"/><path d="M13 0 C11 40 15 70 12 120" stroke="#141210" stroke-width="1" fill="none"/></pattern>
+    <!-- a footprint: toes at the top -->
+    <symbol id="fp" viewBox="0 0 40 90"><ellipse cx="20" cy="30" rx="18" ry="30"/><ellipse cx="20" cy="75" rx="13" ry="14"/></symbol>
+    <!-- a frost fern growing from the bottom-left corner -->
+    <symbol id="ice" viewBox="0 0 100 100" overflow="visible">
+      <path d="M0 100 L60 40 M18 82 L10 60 M18 82 L40 74 M34 66 L30 46 M34 66 L54 60 M48 52 L46 36 M48 52 L64 50"/>
+      <path d="M0 100 L30 20 M10 72 L0 56 M10 72 L24 70 M18 50 L8 36 M18 50 L34 48 M26 36 L20 26"/>
+      <path d="M0 100 L90 70 M30 90 L26 76 M30 90 L40 100 M56 81 L52 66 M56 81 L68 92 M78 74 L74 62"/>
+    </symbol>
+    <!-- a seated guest, lit on the left half -->
+    <symbol id="fig" viewBox="0 0 100 160">
+      <path d="M50 0a26 26 0 0 1 0 52a26 26 0 0 1 0-52ZM0 160C0 100 25 70 50 70C75 70 100 100 100 160Z" fill="#141210"/>
+      <path d="M50 0a26 26 0 0 0 0 52ZM0 160C0 100 25 70 50 70L50 160Z" fill="#e9e2d0"/>
+    </symbol>
+  </defs>
+</svg>
+
+<main id="stage" aria-label="雪夜山庄 十页连载">
+
+<!-- ================= P1 抵达 ================= -->
+<section class="page" id="p1" data-index="0" data-name="抵达" data-sfx="wind">
+  <div class="sheet" data-page="1">
+    <div class="panels">
+      <figure class="panel" id="p1a" style="--h:880">
+        <svg viewBox="0 0 1080 880" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+          <rect width="1080" height="880" fill="#141210"/>
+          <rect width="1080" height="880" fill="url(#snowdots)"/>
+          <g stroke="#e9e2d0" stroke-width="2" opacity=".35"><path d="M120 40l-14 60M400 120l-14 60M860 60l-14 60M300 300l-14 60M980 260l-14 60M620 160l-14 60M180 420l-14 60M760 380l-14 60"/></g>
+          <path d="M0 640L180 560L330 600L520 490L700 520L880 420L1080 450L1080 880L0 880Z" fill="url(#h1)" filter="url(#rough)"/>
+          <g fill="#0a0908" filter="url(#rough)">
+            <path d="M700 440L700 320L760 260L820 320L820 440Z"/><rect x="820" y="330" width="160" height="110"/>
+            <path d="M980 440L980 310L1030 270L1080 310L1080 440Z"/>
+            <rect x="740" y="210" width="22" height="80"/><rect x="900" y="250" width="20" height="90"/>
+          </g>
+          <rect id="p1-window" x="852" y="360" width="18" height="26" fill="#f3e3b0" opacity="0" style="transition:opacity .6s"/>
+          <path d="M120 880C260 760 240 720 420 660S760 540 900 450" fill="none" stroke="#e9e2d0" stroke-width="26" stroke-linecap="round" opacity=".8" filter="url(#rough)"/>
+          <g transform="translate(330 650)">
+            <circle cx="-40" cy="-20" r="80" fill="url(#lampglow)"/><circle cx="60" cy="-26" r="80" fill="url(#lampglow)"/>
+            <rect x="-76" y="-66" width="156" height="74" fill="#0a0908"/>
+            <circle cx="-40" cy="22" r="24" fill="#0a0908"/><circle cx="60" cy="22" r="24" fill="#0a0908"/>
+            <circle cx="-40" cy="-20" r="9" fill="#f3e3b0"/><circle cx="60" cy="-26" r="9" fill="#f3e3b0"/>
+            <path d="M-110 -40l-30 -20l-10 30" stroke="#0a0908" stroke-width="12" fill="none"/>
+          </g>
+        </svg>
+      </figure>
+      <div class="row" style="--h:338">
+        <figure class="panel" id="p1b1">
+          <svg viewBox="0 0 320 338" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="320" height="338" fill="#e9e2d0"/>
+            <rect y="250" width="320" height="88" fill="url(#h2)"/>
+            <rect width="320" height="120" fill="#141210"/><rect y="120" width="320" height="30" fill="url(#h1)"/>
+            <g filter="url(#rough)">
+              <circle cx="160" cy="200" r="118" fill="#141210"/><circle cx="160" cy="200" r="96" fill="#e9e2d0"/>
+              <g stroke="#141210" stroke-width="11"><path d="M160 104V296M64 200H256M92 132l136 136M228 132L92 268"/></g>
+              <circle cx="160" cy="200" r="24" fill="#141210"/>
+            </g>
+            <path d="M40 300c40-20 80 10 120-10s90 0 130-6" stroke="#141210" stroke-width="3" fill="none"/>
+          </svg>
+        </figure>
+        <figure class="panel" id="p1b2">
+          <svg viewBox="0 0 320 338" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="320" height="338" fill="#141210"/>
+            <rect x="40" y="40" width="240" height="258" rx="14" fill="url(#dots)"/>
+            <g fill="#141210" filter="url(#rough)" transform="translate(160 190) rotate(-12)">
+              <ellipse cx="0" cy="20" rx="46" ry="54"/>
+              <ellipse cx="-50" cy="-6" rx="12" ry="30" transform="rotate(-35 -50 -6)"/>
+              <ellipse cx="-22" cy="-62" rx="11" ry="40"/><ellipse cx="4" cy="-72" rx="11" ry="44"/><ellipse cx="30" cy="-64" rx="11" ry="40"/><ellipse cx="52" cy="-40" rx="10" ry="32"/>
+            </g>
+            <rect x="150" y="256" width="6" height="42" fill="#141210"/>
+            <rect x="30" y="30" width="260" height="278" rx="18" fill="none" stroke="#141210" stroke-width="14"/>
+            <rect x="30" y="30" width="260" height="278" rx="18" fill="none" stroke="#e9e2d0" stroke-width="3"/>
+          </svg>
+        </figure>
+        <figure class="panel" id="p1b3">
+          <svg viewBox="0 0 320 338" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="320" height="338" fill="#141210"/>
+            <g stroke="#e9e2d0" stroke-width="3" opacity=".6">
+              <path d="M160 170V20M160 170V320M160 170H10M160 170H310" transform="rotate(15 160 170)"/>
+              <path d="M160 170V20M160 170V320M160 170H10M160 170H310" transform="rotate(60 160 170)"/>
+              <path d="M160 170V20M160 170V320M160 170H10M160 170H310" transform="rotate(105 160 170)"/>
+            </g>
+            <circle cx="160" cy="170" r="110" fill="url(#lampglow)"/>
+            <rect x="142" y="80" width="36" height="30" fill="#141210"/>
+            <rect x="128" y="118" width="64" height="104" fill="#f3e3b0"/>
+            <path d="M160 206c-14-10-18-28-6-44c-2 14 8 18 6 30c8-10 12-22 6-36c14 16 12 42-6 50z" fill="#141210"/>
+            <rect x="120" y="110" width="80" height="120" rx="6" fill="none" stroke="#141210" stroke-width="10"/>
+            <rect x="155" y="230" width="10" height="70" fill="#141210"/>
+          </svg>
+        </figure>
+      </div>
+      <figure class="panel" id="p1c" style="--h:658">
+        <svg viewBox="0 0 1080 658" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+          <rect width="1080" height="658" fill="#e9e2d0"/>
+          <path d="M0 130C300 60 700 170 1080 50L1080 0L0 0Z" fill="url(#h2)" filter="url(#rough)"/>
+          <rect width="1080" height="658" fill="url(#snowfaint)"/>
+          <path d="M0 420c200-40 300 60 520 10s330-90 560-20" stroke="#141210" stroke-width="2.5" fill="none" opacity=".5"/>
+          <path d="M60 600c160-30 260 40 420 0s300-70 540-10" stroke="#141210" stroke-width="2" fill="none" opacity=".4"/>
+          <g fill="#141210" filter="url(#rough)">
+            <use href="#fp" x="166" y="661" width="36" height="80" transform="rotate(38 184 701)"/>
+            <use href="#fp" x="198" y="563" width="36" height="80" transform="rotate(38 216 603)"/>
+            <use href="#fp" x="286" y="510" width="36" height="80" transform="rotate(38 304 550)"/>
+            <use href="#fp" x="319" y="412" width="36" height="80" transform="rotate(38 337 452)"/>
+            <use href="#fp" x="407" y="359" width="36" height="80" transform="rotate(38 425 399)"/>
+            <use href="#fp" x="439" y="261" width="36" height="80" transform="rotate(38 457 301)"/>
+            <use href="#fp" x="527" y="207" width="36" height="80" transform="rotate(38 545 247)"/>
+            <use href="#fp" x="559" y="110" width="36" height="80" transform="rotate(38 577 150)"/>
+          </g>
+          <ellipse cx="572" cy="130" rx="34" ry="24" fill="#e9e2d0" filter="url(#rough)"/>
+          <path d="M540 120c20-8 44-8 64 0" stroke="#141210" stroke-width="2" fill="none" opacity=".5"/>
+        </svg>
+      </figure>
+    </div>
+    <img class="art" alt="">
+    <div class="say" style="left:6%;top:5%">雪已经封了山道。</div>
+    <div class="say tail-none" style="right:6%;bottom:8%">再有一里，就到了。</div>
+    <div class="sfx light" style="left:5%;top:38%;transform:rotate(-8deg)">呼——</div>
+    <div class="hot main" data-cu="cu-hand" data-nudge="p1b2" data-sfx="wind" style="left:36%;top:48%;width:28%;height:16%" role="button" tabindex="0" aria-label="车窗内侧的呵气手印"></div>
+    <div class="hot" data-action="window" data-nudge="p1a" data-sfx="wind" style="left:64%;top:12%;width:34%;height:12%" role="button" tabindex="0" aria-label="山庄剪影"></div>
+    <div class="hot" data-cu="cu-print" data-nudge="p1c" data-sfx="snow" style="left:48%;top:70%;width:14%;height:7%" role="button" tabindex="0" aria-label="被落雪盖住一半的脚印"></div>
+  </div>
+</section>
+
+<!-- ================= P2 大厅 ================= -->
+<section class="page" id="p2" data-index="1" data-name="大厅" data-sfx="tick">
+  <div class="sheet" data-page="2">
+    <div class="panels">
+      <div class="row flush" style="--h:700">
+        <figure class="panel" id="p2a1">
+          <svg viewBox="0 0 346 700" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="346" height="700" fill="#141210"/>
+            <rect width="346" height="700" fill="url(#hx)" opacity=".45"/>
+            <rect x="24" width="10" height="700" fill="#e9e2d0" opacity=".55"/><rect x="40" width="4" height="700" fill="#e9e2d0" opacity=".4"/>
+            <g fill="#6b655a" filter="url(#rough)">
+              <use href="#fp" x="158" y="-30" width="36" height="80" transform="rotate(190 176 10)" opacity="1"/>
+              <use href="#fp" x="196" y="80" width="36" height="80" transform="rotate(190 214 120)" opacity=".9"/>
+              <use href="#fp" x="160" y="185" width="36" height="80" transform="rotate(190 178 225)" opacity=".8"/>
+              <use href="#fp" x="198" y="290" width="36" height="80" transform="rotate(190 216 330)" opacity=".7"/>
+              <use href="#fp" x="162" y="400" width="36" height="80" transform="rotate(190 180 440)" opacity=".6"/>
+              <use href="#fp" x="200" y="505" width="36" height="80" transform="rotate(190 218 545)" opacity=".5"/>
+              <use href="#fp" x="164" y="610" width="36" height="80" transform="rotate(190 182 650)" opacity=".4"/>
+            </g>
+            <g fill="#e9e2d0" opacity=".5"><ellipse cx="190" cy="60" rx="5" ry="3"/><ellipse cx="170" cy="260" rx="4" ry="2.5"/><ellipse cx="230" cy="380" rx="4" ry="2"/></g>
+          </svg>
+        </figure>
+        <figure class="panel" id="p2a2">
+          <svg viewBox="0 0 346 700" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="346" height="700" fill="url(#wood)"/>
+            <rect width="346" height="700" fill="#141210" opacity=".35"/>
+            <rect x="83" y="130" width="180" height="440" rx="10" fill="#141210" filter="url(#rough)"/>
+            <circle cx="173" cy="250" r="84" fill="#e9e2d0"/>
+            <g stroke="#141210" stroke-width="5">
+              <path d="M173 174v16" transform="rotate(0 173 250)"/><path d="M173 174v16" transform="rotate(30 173 250)"/><path d="M173 174v16" transform="rotate(60 173 250)"/><path d="M173 174v16" transform="rotate(90 173 250)"/><path d="M173 174v16" transform="rotate(120 173 250)"/><path d="M173 174v16" transform="rotate(150 173 250)"/><path d="M173 174v16" transform="rotate(180 173 250)"/><path d="M173 174v16" transform="rotate(210 173 250)"/><path d="M173 174v16" transform="rotate(240 173 250)"/><path d="M173 174v16" transform="rotate(270 173 250)"/><path d="M173 174v16" transform="rotate(300 173 250)"/><path d="M173 174v16" transform="rotate(330 173 250)"/>
+            </g>
+            <path d="M173 250V192" stroke="#141210" stroke-width="8" stroke-linecap="round" transform="rotate(-6 173 250)"/>
+            <path d="M173 250V178" stroke="#141210" stroke-width="4" stroke-linecap="round" transform="rotate(282 173 250)"/>
+            <circle cx="173" cy="250" r="7" fill="#141210"/>
+            <path d="M120 200l40 36l-10 20l30 14" stroke="#141210" stroke-width="1.5" fill="none" opacity=".6"/>
+            <rect x="121" y="356" width="104" height="194" fill="url(#h1)"/>
+            <rect x="121" y="356" width="104" height="194" fill="none" stroke="#e9e2d0" stroke-width="3"/>
+            <path d="M173 356V700" stroke="#e9e2d0" stroke-width="6"/>
+            <text x="173" y="612" fill="#e9e2d0" font-family="Georgia,serif" font-size="30" text-anchor="middle" letter-spacing="4">11:47</text>
+          </svg>
+        </figure>
+        <figure class="panel" id="p2a3">
+          <svg viewBox="0 0 346 700" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="346" height="700" fill="url(#wood)"/>
+            <rect width="346" height="700" fill="#141210" opacity=".5"/>
+            <g filter="url(#rough)">
+              <rect x="70" y="120" width="206" height="430" rx="14" fill="#141210"/>
+              <rect x="92" y="150" width="162" height="300" fill="url(#h1)"/>
+              <path d="M44 190C56 120 290 110 302 190L334 530C250 480 140 505 36 548Z" fill="#141210"/>
+              <path d="M44 190C56 120 290 110 302 190L334 530C250 480 140 505 36 548Z" fill="url(#h1)" opacity=".55"/>
+              <path d="M120 200C110 300 100 420 70 520M222 190C240 320 272 430 322 500M170 196C168 300 176 420 190 520" stroke="#e9e2d0" stroke-width="3" fill="none"/>
+              <rect x="90" y="548" width="16" height="152" fill="#141210"/><rect x="240" y="548" width="16" height="152" fill="#141210"/>
+            </g>
+            <g fill="#fbf8f1"><circle cx="90" cy="170" r="5"/><circle cx="140" cy="150" r="4"/><circle cx="200" cy="146" r="6"/><circle cx="250" cy="160" r="4"/><circle cx="110" cy="230" r="3"/><circle cx="280" cy="220" r="5"/><circle cx="170" cy="200" r="3"/><circle cx="300" cy="300" r="4"/><circle cx="60" cy="300" r="3"/></g>
+          </svg>
+        </figure>
+      </div>
+      <div class="row flush" style="--h:1198">
+        <figure class="panel" id="p2b1" style="flex:760">
+          <svg viewBox="0 0 760 1198" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="760" height="1198" fill="#141210"/>
+            <rect width="760" height="130" fill="url(#h1)" opacity=".6"/>
+            <rect x="0" y="130" width="760" height="22" fill="#e9e2d0" opacity=".35"/>
+            <rect x="540" y="160" width="220" height="470" fill="url(#hx)"/>
+            <rect x="574" y="250" width="150" height="380" fill="#0a0908"/>
+            <g filter="url(#rough)"><path d="M600 630C590 560 630 530 630 470C650 520 680 510 670 460C700 510 720 560 705 630Z" fill="#f3e3b0"/><path d="M622 630C618 580 644 570 648 530C662 570 684 580 678 630Z" fill="#fbf8f1" opacity=".8"/></g>
+            <ellipse cx="640" cy="690" rx="300" ry="110" fill="url(#lampglow)" opacity=".7"/>
+            <path d="M0 700L760 700L760 1198L0 1198Z" fill="url(#wood)"/><path d="M0 700L760 700L760 1198L0 1198Z" fill="#141210" opacity=".6"/>
+            <g filter="url(#rough)">
+              <use href="#fig" x="110" y="200" width="110" height="180" transform="scale(-1 1) translate(-330 0)"/>
+              <use href="#fig" x="260" y="160" width="110" height="180" transform="scale(-1 1) translate(-630 0)"/>
+              <use href="#fig" x="400" y="130" width="110" height="180" transform="scale(-1 1) translate(-910 0)"/>
+              <use href="#fig" x="520" y="260" width="130" height="300" transform="scale(-1 1) translate(-1170 0)"/>
+            </g>
+            <path d="M80 520L470 360L640 420L300 640Z" fill="#e9e2d0" filter="url(#rough)"/>
+            <path d="M80 520L470 360L640 420L300 640Z" fill="url(#h3)"/>
+            <path d="M80 520L300 640L300 820L80 700Z" fill="#141210"/><path d="M300 640L640 420L640 600L300 820Z" fill="url(#h1)" opacity=".8"/>
+            <g filter="url(#rough)">
+              <path d="M20 420L120 380L120 560L20 600Z" fill="#141210"/><path d="M20 420L120 380L120 560L20 600Z" fill="url(#h1)" opacity=".5"/>
+              <path d="M60 600L80 790" stroke="#141210" stroke-width="12"/>
+            </g>
+            <g transform="translate(400 470) rotate(-22)" filter="url(#rough2)">
+              <rect x="-62" y="-42" width="124" height="84" fill="#fbf8f1" stroke="#141210" stroke-width="4"/>
+              <path d="M-62 -42L0 12L62 -42" fill="none" stroke="#141210" stroke-width="4"/>
+              <circle cx="0" cy="24" r="11" fill="#6e1212"/>
+            </g>
+            <g fill="#0a0908" filter="url(#rough)">
+              <path d="M40 1198C40 900 90 760 180 740C270 760 300 900 300 1198Z"/>
+              <circle cx="170" cy="700" r="62"/>
+              <path d="M300 1198C300 980 350 860 440 840C520 860 560 980 560 1198Z"/>
+              <circle cx="430" cy="800" r="60"/>
+            </g>
+            <path d="M110 760C140 740 200 740 240 760" stroke="#e9e2d0" stroke-width="3" fill="none" opacity=".6"/>
+            <path d="M380 860C420 840 480 840 520 862" stroke="#e9e2d0" stroke-width="3" fill="none" opacity=".6"/>
+          </svg>
+        </figure>
+        <figure class="panel" id="p2b2" style="flex:298">
+          <svg viewBox="0 0 298 1198" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="298" height="1198" fill="#141210"/>
+            <rect x="40" width="218" height="1198" fill="url(#h1)" opacity=".45"/>
+            <rect x="40" width="8" height="1198" fill="#e9e2d0" opacity=".5"/><rect x="250" width="8" height="1198" fill="#e9e2d0" opacity=".5"/>
+            <path d="M149 0V960" stroke="#e9e2d0" stroke-width="10"/>
+            <circle cx="149" cy="1010" r="72" fill="#e9e2d0"/><circle cx="149" cy="1010" r="52" fill="url(#dots)"/><circle cx="149" cy="1010" r="10" fill="#141210"/>
+            <path d="M50 1100Q149 1150 248 1100" stroke="#e9e2d0" stroke-width="3" fill="none" opacity=".6"/>
+            <path d="M70 1070Q149 1110 228 1070" stroke="#e9e2d0" stroke-width="2" fill="none" opacity=".4"/>
+            <path d="M149 1082V1198" stroke="#e9e2d0" stroke-width="4"/>
+          </svg>
+        </figure>
+      </div>
+    </div>
+    <img class="art" alt="">
+    <div class="say" style="left:4%;top:40%">主人还没下来？</div>
+    <div class="say" style="left:44%;top:40%">钟……停了。</div>
+    <div class="sfx light vert" style="right:9%;bottom:30%;font-size:calc(96*var(--u))">嗒 嗒</div>
+    <div class="hot main" data-cu="cu-letter" data-nudge="p2b1" data-sfx="paper" style="left:31%;top:58%;width:16%;height:8%" role="button" tabindex="0" aria-label="桌上未拆的信"></div>
+    <div class="hot" data-cu="cu-clock" data-nudge="p2a2" data-sfx="tick" style="left:41%;top:8%;width:18%;height:12%" role="button" tabindex="0" aria-label="停在 11:47 的挂钟"></div>
+    <div class="hot" data-cu="cu-cloak" data-nudge="p2a3" data-sfx="snow" style="left:72%;top:6%;width:26%;height:24%" role="button" tabindex="0" aria-label="搭着斗篷的主人座椅"></div>
+  </div>
+</section>
+
+<!-- ================= P3 第一具尸体 ================= -->
+<section class="page" id="p3" data-index="2" data-name="第一具尸体" data-sfx="crack">
+  <div class="sheet" data-page="3">
+    <div class="panels">
+      <figure class="panel" id="p3a" style="--h:380">
+        <svg viewBox="0 0 1080 380" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+          <rect width="1080" height="380" fill="#141210"/>
+          <rect width="1080" height="380" fill="url(#h1)" opacity=".3"/>
+          <rect x="120" y="30" width="300" height="350" fill="#e9e2d0" opacity=".12"/>
+          <rect x="150" y="50" width="240" height="330" fill="url(#wood)"/><rect x="150" y="50" width="240" height="330" fill="#141210" opacity=".55"/>
+          <rect x="175" y="80" width="190" height="120" fill="none" stroke="#141210" stroke-width="8"/>
+          <circle cx="362" cy="230" r="10" fill="#e9e2d0"/>
+          <path d="M931 0V250" stroke="#e9e2d0" stroke-width="10"/>
+          <g stroke="#e9e2d0" stroke-width="6" stroke-linecap="round" opacity=".9"><path d="M860 380L700 330M880 350L780 270M1000 350L1080 280M980 380L1080 350M931 230V150"/></g>
+          <circle cx="931" cy="310" r="70" fill="#e9e2d0" filter="url(#rough)"/><circle cx="931" cy="310" r="50" fill="url(#dots)"/>
+          <path d="M931 378L900 380M931 378L980 380M931 378L870 380M931 378L1010 380" stroke="#e9e2d0" stroke-width="3"/>
+          <path d="M700 380L740 340L790 360L860 320" stroke="#e9e2d0" stroke-width="3" fill="none" opacity=".7"/>
+        </svg>
+      </figure>
+      <div class="row" style="--h:938">
+        <figure class="panel" id="p3b1">
+          <svg viewBox="0 0 320 938" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="320" height="938" fill="url(#wood)"/>
+            <rect width="320" height="938" fill="#141210" opacity=".35"/>
+            <rect x="40" y="60" width="240" height="320" fill="none" stroke="#141210" stroke-width="10"/>
+            <rect x="40" y="500" width="240" height="380" fill="none" stroke="#141210" stroke-width="10"/>
+            <g filter="url(#rough)">
+              <rect x="0" y="380" width="34" height="130" fill="#141210"/>
+              <rect x="30" y="400" width="210" height="92" fill="#141210"/>
+              <rect x="60" y="426" width="200" height="40" rx="20" fill="#e9e2d0"/>
+              <rect x="0" y="426" width="70" height="40" rx="8" fill="#e9e2d0"/>
+              <circle cx="130" cy="580" r="18" fill="#141210"/><path d="M121 592L139 592L146 636L114 636Z" fill="#141210"/>
+            </g>
+            <path d="M130 560l60 60M160 540l50 40M120 620l60 50M70 440l40 10" stroke="#141210" stroke-width="3" opacity=".8"/>
+            <path d="M80 440l30-6M90 452l30-6" stroke="#e9e2d0" stroke-width="2" opacity=".8"/>
+          </svg>
+        </figure>
+        <figure class="panel" id="p3b2">
+          <svg viewBox="0 0 436 938" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="436" height="938" fill="#141210"/>
+            <rect width="436" height="938" fill="url(#h1)" opacity=".22"/>
+            <rect x="48" y="40" width="340" height="520" fill="#0a0908"/>
+            <g stroke="#e9e2d0" fill="none" stroke-width="3" stroke-linecap="round" filter="url(#rough2)">
+              <use href="#ice" x="60" y="110" width="150" height="180"/>
+              <use href="#ice" x="60" y="300" width="150" height="250" transform="scale(1 -1) translate(0 -850)"/>
+              <use href="#ice" x="230" y="110" width="150" height="180" transform="scale(-1 1) translate(-610 0)"/>
+              <use href="#ice" x="230" y="300" width="150" height="250" transform="scale(-1 -1) translate(-610 -850)"/>
+              <use href="#ice" x="100" y="320" width="100" height="120" transform="rotate(20 150 380)"/>
+              <use href="#ice" x="240" y="330" width="100" height="120" transform="rotate(-30 290 390)"/>
+            </g>
+            <rect x="48" y="40" width="340" height="520" fill="none" stroke="#e9e2d0" stroke-width="14"/>
+            <path d="M218 40V560M48 300H388" stroke="#e9e2d0" stroke-width="10"/>
+            <rect x="30" y="556" width="376" height="26" fill="#e9e2d0"/>
+            <g fill="#141210" filter="url(#rough)">
+              <path d="M70 938C60 820 90 720 170 700C230 685 300 720 330 780C360 840 350 900 340 938Z"/>
+              <circle cx="150" cy="660" r="54"/>
+              <path d="M300 780C350 810 400 850 420 910L400 938L330 938Z"/>
+            </g>
+            <path d="M70 938C60 820 90 720 170 700C230 685 300 720 330 780" fill="none" stroke="#e9e2d0" stroke-width="3" opacity=".65"/>
+            <path d="M120 712C140 700 170 696 196 702" stroke="#e9e2d0" stroke-width="4" fill="none"/>
+            <ellipse cx="398" cy="926" rx="44" ry="12" fill="#6e1212" filter="url(#rough)"/>
+          </svg>
+        </figure>
+        <figure class="panel" id="p3b3">
+          <svg viewBox="0 0 320 938" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="320" height="938" fill="#141210"/>
+            <rect width="320" height="938" fill="url(#h1)" opacity=".2"/>
+            <g filter="url(#rough)">
+              <path d="M90 938L110 640C115 600 205 600 210 640L230 938Z" fill="#e9e2d0"/>
+              <path d="M90 938L110 640C115 600 205 600 210 640L230 938Z" fill="url(#h3)"/>
+              <ellipse cx="160" cy="590" rx="72" ry="62" fill="#e9e2d0"/>
+            </g>
+            <path d="M100 580C110 540 220 540 220 580M110 602Q160 644 215 602M120 624Q160 656 205 624M132 646Q160 668 192 646" stroke="#141210" stroke-width="3.5" fill="none"/>
+            <g transform="translate(160 470) rotate(-14)" filter="url(#rough2)">
+              <path d="M-56 -92L56 -92L56 20L30 40L10 20L-10 42L-30 24L-56 40Z" fill="#fbf8f1" stroke="#141210" stroke-width="4"/>
+              <text x="-46" y="-56" font-family="Georgia,serif" font-size="36" font-weight="700" fill="#141210">Q</text>
+              <path d="M-36 -40C-36 -40 -20 -24 -20 -14A7 7 0 0 1 -33 -11L-28 -2L-44 -2L-39 -11A7 7 0 0 1 -52 -14C-52 -24 -36 -40 -36 -40Z" fill="#141210"/>
+              <circle cx="22" cy="-30" r="13" fill="#6e1212"/>
+              <path d="M14 -34c4 4 10 4 16 0M16 -26c3 2 8 2 12 0" stroke="#fbf8f1" stroke-width="1.2" fill="none" opacity=".6"/>
+            </g>
+          </svg>
+        </figure>
+      </div>
+      <figure class="panel" id="p3c" style="--h:558">
+        <svg viewBox="0 0 1080 558" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+          <rect width="1080" height="558" fill="url(#wood)"/>
+          <rect width="1080" height="558" fill="#141210" opacity=".32"/>
+          <g stroke="#141210" stroke-width="6" opacity=".9"><path d="M0 140H1080M0 290H1080M0 440H1080"/></g>
+          <g transform="translate(300 250) rotate(25)" filter="url(#rough)">
+            <ellipse cx="120" cy="40" rx="150" ry="20" fill="#141210" opacity=".35"/>
+            <g fill="#141210"><circle cx="0" cy="0" r="42"/><rect x="30" y="-10" width="210" height="20"/><rect x="196" y="0" width="16" height="42"/><rect x="226" y="0" width="14" height="32"/></g>
+            <circle cx="0" cy="0" r="18" fill="#e9e2d0"/>
+          </g>
+          <g stroke="#e9e2d0" stroke-width="3" fill="none" stroke-linecap="round" filter="url(#rough2)">
+            <path d="M560 0L540 90L580 170L560 260L600 350L590 460L620 558"/>
+            <path d="M540 90L470 140L440 220M580 170L660 200L700 280M560 260L500 320L480 420M600 350L680 400L720 500L730 558M590 460L540 520L530 558"/>
+          </g>
+        </svg>
+      </figure>
+    </div>
+    <img class="art" alt="">
+    <div class="say" style="left:5%;top:74%">门是从里面锁的。</div>
+    <div class="sfx light" style="left:56%;top:4%;font-size:calc(200*var(--u));transform:rotate(-6deg)">咚</div>
+    <div class="hot main" data-cu="cu-ice" data-nudge="p3b2" data-sfx="crack" style="left:32%;top:24%;width:36%;height:34%" role="button" tabindex="0" aria-label="结满冰花的窗"></div>
+    <div class="hot" data-cu="cu-lock" data-nudge="p3b1" data-sfx="click" style="left:4%;top:41%;width:22%;height:16%" role="button" tabindex="0" aria-label="从内侧扣上的门闩"></div>
+    <div class="hot" data-cu="cu-card" data-nudge="p3b3" data-sfx="paper" style="left:74%;top:40%;width:22%;height:16%" role="button" tabindex="0" aria-label="死者手里的半张牌"></div>
+  </div>
+</section>
+
+<!-- ================= P4 搜查 ================= -->
+<section class="page" id="p4" data-index="3" data-name="搜查" data-sfx="click">
+  <div class="sheet" data-page="4">
+    <div class="panels">
+      <div class="row" style="--h:400">
+        <figure class="panel" id="p4a1">
+          <svg viewBox="0 0 320 400" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="320" height="400" fill="#141210"/>
+            <path d="M200 0L190 50L210 90" stroke="#e9e2d0" stroke-width="2" fill="none" opacity=".4"/>
+            <g filter="url(#rough)">
+              <path d="M0 250L120 225L132 305L0 335Z" fill="#e9e2d0"/><path d="M0 250L120 225L132 305L0 335Z" fill="url(#h3)"/>
+              <ellipse cx="152" cy="262" rx="56" ry="50" fill="#e9e2d0"/>
+              <rect x="150" y="236" width="150" height="52" rx="8" fill="#141210" stroke="#e9e2d0" stroke-width="6"/>
+              <path d="M296 226L320 216L320 308L296 298Z" fill="#f3e3b0"/>
+            </g>
+            <path d="M118 250Q152 290 190 252M126 274Q152 300 184 274" stroke="#141210" stroke-width="3" fill="none"/>
+            <path d="M300 262L320 190M300 266L320 340" stroke="#f3e3b0" stroke-width="4" opacity=".8"/>
+          </svg>
+        </figure>
+        <figure class="panel" id="p4a2">
+          <svg viewBox="0 0 320 400" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="320" height="400" fill="#141210"/>
+            <path d="M160 0L150 60L170 110M140 0L130 40" stroke="#e9e2d0" stroke-width="2" fill="none" opacity=".45"/>
+            <rect x="60" y="30" width="200" height="370" fill="none" stroke="#e9e2d0" stroke-width="10"/>
+            <path d="M70 40L190 70L190 400L70 400Z" fill="url(#wood)"/><path d="M70 40L190 70L190 400L70 400Z" fill="#141210" opacity=".5"/>
+            <path d="M190 70L250 40L250 400L190 400Z" fill="#f3e3b0" filter="url(#rough)"/>
+            <path d="M190 70L250 40L250 400L190 400Z" fill="url(#h3)" opacity=".35"/>
+            <text x="104" y="190" fill="#e9e2d0" font-family="Georgia,serif" font-size="48" font-weight="700" transform="skewY(14)">3</text>
+            <circle cx="176" cy="240" r="8" fill="#e9e2d0"/>
+          </svg>
+        </figure>
+        <figure class="panel" id="p4a3">
+          <svg viewBox="0 0 320 400" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="320" height="400" fill="url(#wood)"/><rect width="320" height="400" fill="#141210" opacity=".5"/>
+            <g fill="#141210"><rect y="118" width="320" height="16"/><rect y="262" width="320" height="16"/><rect y="390" width="320" height="10"/></g>
+            <g fill="#141210" stroke="#e9e2d0" stroke-width="3">
+              <rect x="10" y="30" width="26" height="88"/><rect x="40" y="46" width="22" height="72"/><rect x="66" y="26" width="30" height="92"/><rect x="100" y="50" width="24" height="68"/><rect x="128" y="38" width="28" height="80"/><rect x="160" y="30" width="22" height="88"/><rect x="186" y="56" width="30" height="62"/><rect x="220" y="34" width="26" height="84"/><rect x="250" y="48" width="24" height="70"/><rect x="278" y="30" width="32" height="88"/>
+              <rect x="10" y="160" width="30" height="102"/><rect x="44" y="176" width="24" height="86"/><rect x="72" y="150" width="28" height="112"/><rect x="104" y="170" width="26" height="92"/><rect x="134" y="156" width="30" height="106"/><rect x="168" y="178" width="26" height="84"/>
+              <rect x="10" y="294" width="26" height="96"/><rect x="40" y="310" width="30" height="80"/><rect x="74" y="290" width="24" height="100"/><rect x="102" y="316" width="28" height="74"/><rect x="134" y="298" width="24" height="92"/><rect x="162" y="306" width="30" height="84"/><rect x="196" y="292" width="26" height="98"/><rect x="226" y="314" width="28" height="76"/><rect x="258" y="296" width="24" height="94"/><rect x="286" y="310" width="24" height="80"/>
+            </g>
+            <rect x="236" y="150" width="60" height="112" fill="#0a0908"/>
+            <rect x="236" y="150" width="60" height="112" fill="url(#h1)" opacity=".25"/>
+            <rect x="250" y="232" width="34" height="22" fill="#fbf8f1" transform="rotate(-12 267 243)"/>
+            <rect x="200" y="152" width="28" height="110" fill="#e9e2d0" stroke="#141210" stroke-width="3" transform="rotate(-16 214 262)"/>
+          </svg>
+        </figure>
+      </div>
+      <figure class="panel" id="p4b" style="--h:758">
+        <svg viewBox="0 0 1080 758" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+          <rect width="1080" height="758" fill="#141210"/>
+          <path d="M0 0L1080 0L600 280L480 280Z" fill="url(#h1)" opacity=".5"/>
+          <path d="M0 758L1080 758L600 320L480 320Z" fill="url(#wood)"/><path d="M0 758L1080 758L600 320L480 320Z" fill="#141210" opacity=".6"/>
+          <g stroke="#141210" stroke-width="4"><path d="M540 300L150 758M540 300L300 758M540 300L440 758M540 300L640 758M540 300L780 758M540 300L930 758"/></g>
+          <path d="M0 0L480 280L480 320L0 758Z" fill="#1c1916"/><path d="M1080 0L600 280L600 320L1080 758Z" fill="#1c1916"/>
+          <path d="M0 0L480 280L480 320L0 758Z" fill="url(#h1)" opacity=".2"/><path d="M1080 0L600 280L600 320L1080 758Z" fill="url(#h1)" opacity=".2"/>
+          <g fill="#0a0908" stroke="#e9e2d0" stroke-width="5" filter="url(#rough2)">
+            <path d="M60 120L200 196L200 560L60 640Z"/><path d="M260 230L350 270L350 470L260 520Z"/><path d="M390 288L440 310L440 400L390 420Z"/>
+            <path d="M1020 120L880 196L880 560L1020 640Z"/><path d="M820 230L730 270L730 470L820 520Z"/><path d="M690 288L640 310L640 400L690 420Z"/>
+          </g>
+          <rect x="500" y="250" width="80" height="80" fill="#0a0908" stroke="#e9e2d0" stroke-width="4"/>
+          <path d="M0 650L560 300L540 236L0 540Z" fill="#f3e3b0" opacity=".88" filter="url(#rough)"/>
+          <path d="M0 650L560 300L540 236L0 540Z" fill="url(#h3)" opacity=".3"/>
+          <g fill="#fbf8f1" opacity=".7"><circle cx="120" cy="560" r="2"/><circle cx="220" cy="520" r="1.5"/><circle cx="330" cy="440" r="2"/><circle cx="410" cy="400" r="1.5"/><circle cx="180" cy="590" r="1.2"/></g>
+        </svg>
+      </figure>
+      <figure class="panel" id="p4c" style="--h:718">
+        <svg viewBox="0 0 1080 718" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+          <rect width="1080" height="718" fill="#e9e2d0"/>
+          <rect width="1080" height="718" fill="url(#snowfaint)"/>
+          <path d="M0 0L240 0L700 718L420 718Z" fill="#fbf8f1" opacity=".95"/>
+          <path d="M680 0L760 0C800 200 860 400 940 718L860 718C790 500 720 250 680 0Z" fill="url(#h2)" filter="url(#rough)"/>
+          <path d="M760 0C810 220 870 440 950 718" stroke="#141210" stroke-width="3" fill="none" opacity=".7"/>
+          <g fill="#141210" filter="url(#rough)">
+            <use href="#fp" x="134" y="-50" width="36" height="80" transform="rotate(134 152 -10)"/>
+            <use href="#fp" x="187" y="35" width="36" height="80" transform="rotate(134 205 75)"/>
+            <use href="#fp" x="288" y="85" width="36" height="80" transform="rotate(134 306 125)"/>
+            <use href="#fp" x="340" y="182" width="36" height="80" transform="rotate(134 358 222)"/>
+            <use href="#fp" x="441" y="231" width="36" height="80" transform="rotate(134 459 271)"/>
+            <use href="#fp" x="493" y="329" width="36" height="80" transform="rotate(134 511 369)"/>
+            <use href="#fp" x="594" y="378" width="36" height="80" transform="rotate(134 612 418)" opacity=".55"/>
+          </g>
+          <g stroke="#141210" stroke-width="2" opacity=".35"><path d="M60 300l120-30M100 420l140-20M200 600l120-40M820 100l100-30M700 560l120-20"/></g>
+        </svg>
+      </figure>
+    </div>
+    <img class="art" alt="">
+    <div class="say tail-left" style="left:4%;top:66%">脚印到这儿……没了。</div>
+    <div class="sfx light" style="left:8%;top:12%;font-size:calc(120*var(--u))">咔</div>
+    <div class="hot main" data-cu="cu-door" data-nudge="p4b" data-sfx="click" style="left:36%;top:30%;width:28%;height:26%" role="button" tabindex="0" aria-label="走廊尽头被光柱照到的门"></div>
+    <div class="hot" data-cu="cu-snow" data-nudge="p4c" data-sfx="snow" style="left:44%;top:76%;width:22%;height:12%" role="button" tabindex="0" aria-label="凭空消失的雪地脚印"></div>
+    <div class="hot" data-cu="cu-shelf" data-nudge="p4a3" data-sfx="paper" style="left:70%;top:3%;width:27%;height:17%" role="button" tabindex="0" aria-label="书架上的暗格"></div>
+  </div>
+</section>
+
+<section class="page" id="archive" data-index="4" data-name="暗室" data-sfx="paper">
+  <div class="sheet" data-page="6">
+    <div class="panels">
+      <figure class="panel" id="archive-ledger" style="--h:625"><svg viewBox="0 0 1080 625" preserveAspectRatio="xMidYMid slice" aria-hidden="true"><rect width="1080" height="625" fill="url(#wood)"/><rect width="1080" height="625" fill="#141210" opacity=".62"/><g transform="rotate(-6 540 310)" filter="url(#rough)"><path d="M290 110H510L540 135L570 110H790V420H570L540 445L510 420H290Z M540 135V445" fill="url(#h2)" stroke="#141210" stroke-width="14"/><path d="M330 220H495M330 265H495M590 220H745M590 265H745M595 321H745" fill="none" stroke="#6e1212" stroke-width="12"/></g><text x="540" y="550" text-anchor="middle" font-size="46" fill="#fbf8f1">诊疗簿</text></svg></figure>
+      <figure class="panel" id="archive-thread" style="--h:625"><svg viewBox="0 0 1080 625" preserveAspectRatio="xMidYMid slice" aria-hidden="true"><rect width="1080" height="625" fill="url(#wood)"/><rect width="1080" height="625" fill="#141210" opacity=".62"/><g transform="rotate(0 540 310)" filter="url(#rough)"><path d="M300 170H780V340H300Z M360 250H710 M670 190V310" fill="url(#h2)" stroke="#141210" stroke-width="14"/><path d="M750 340Q840 430 550 430T325 350" fill="none" stroke="#6e1212" stroke-width="12"/></g><text x="540" y="550" text-anchor="middle" font-size="46" fill="#fbf8f1">门闩试拨</text></svg></figure>
+      <figure class="panel" id="archive-kit" style="--h:625"><svg viewBox="0 0 1080 625" preserveAspectRatio="xMidYMid slice" aria-hidden="true"><rect width="1080" height="625" fill="url(#wood)"/><rect width="1080" height="625" fill="#141210" opacity=".62"/><g transform="rotate(6 540 310)" filter="url(#rough)"><path d="M440 195V110H640V195 M270 195H810V445H270Z M270 280H810 M500 250H580V345H500Z" fill="url(#h2)" stroke="#141210" stroke-width="14"/><path d="M570 268l65-37-10 80z" fill="none" stroke="#6e1212" stroke-width="12"/></g><text x="540" y="550" text-anchor="middle" font-size="46" fill="#fbf8f1">医生的药箱</text></svg></figure>
+    </div>
+    <img class="art" alt="">
+    <div class="say tail-none" style="left:5%;top:4%">三号房里，药味盖过了霉味。</div>
+    <div class="say tail-none" style="left:6%;top:38%">窗是障眼法。试试门闩。</div>
+    <div class="say tail-none" style="left:5%;top:71%">楼下的灯，忽然灭了。</div>
+    <div class="hot main" data-cu="cu-ledger" data-nudge="archive-ledger" data-sfx="paper" style="left:22%;top:4%;width:56%;height:25%" role="button" tabindex="0" aria-label="诊疗簿"></div>
+    <div class="hot main" data-cu="cu-thread" data-nudge="archive-thread" data-sfx="paper" style="left:22%;top:37.7%;width:56%;height:25%" role="button" tabindex="0" aria-label="门闩试拨"></div>
+    <div class="hot main" data-cu="cu-kit" data-nudge="archive-kit" data-sfx="paper" style="left:22%;top:71.4%;width:56%;height:25%" role="button" tabindex="0" aria-label="医生的药箱"></div>
+  </div>
+</section>
+
+<section class="page chase-page" id="seep" data-index="5" data-name="渗痕" data-sfx="thud">
+  <div class="sheet" data-page="7">
+    <div class="panels"><figure class="panel" style="--h:1920">
+      <svg viewBox="0 0 1080 1920" aria-hidden="true">
+        <rect width="1080" height="1920" fill="#141210"/><path d="M55 120H1025V1760H55Z" fill="url(#h1)" stroke="#e9e2d0" stroke-width="7"/>
+        <path d="M90 1510L540 790L990 1510V1720H90Z" fill="url(#wood)" opacity=".64"/>
+        <path d="M240 590H840V1050H240Z M240 760H840 M420 590V760 M660 590V760 M460 690H620 M490 690V745H590V690" fill="none" stroke="#d6cdb8" stroke-width="17" filter="url(#rough)"/>
+        <path class="beat-rattle" d="M460 690H620 M490 690V745H590V690" fill="none" stroke="#f3e3b0" stroke-width="21"/>
+        <path class="beat-blood" pathLength="1" d="M560 1040Q565 1125 612 1200T650 1390L690 1530" fill="none" stroke="#a63835" stroke-width="26" stroke-linecap="round"/>
+        
+        
+        <path d="M471 944L535 931L566 977L501 1017L465 994Z" fill="#e9e2d0"/><path d="M491 966h32m-16-14v30" stroke="#9b3431" stroke-width="8"/>
+        <text x="540" y="1570" text-anchor="middle" font-size="46" letter-spacing="9" fill="#e9e2d0">暗室 · 柜底</text>
+      </svg>
+    </figure></div>
+    <img class="art" alt="">
+    <div class="say tail-none chase-caption">搭扣突然颤了一下。柜底的血，正顺着地板缝往外走。</div>
+    <button class="hot main" data-cu="cu-seam" data-sfx="paper" style="left:37%;top:46%;width:20%;height:10%" aria-label="夹在柜底的布条"></button>
+    <button class="hot main" data-cu="cu-trail" data-sfx="paper" style="left:46%;top:64%;width:20%;height:10%" aria-label="地板缝里的血迹"></button>
+  </div>
+</section>
+
+<section class="page chase-page" id="flight" data-index="6" data-name="北廊" data-sfx="wind">
+  <div class="sheet" data-page="8">
+    <div class="panels"><figure class="panel" style="--h:1920">
+      <svg viewBox="0 0 1080 1920" aria-hidden="true">
+        <rect width="1080" height="1920" fill="#141210"/><path d="M55 120H1025V1760H55Z" fill="url(#h1)" stroke="#e9e2d0" stroke-width="7"/>
+        <path d="M90 1510L540 790L990 1510V1720H90Z" fill="url(#wood)" opacity=".64"/>
+        <path d="M100 420L540 700L980 420 M100 1420L540 850L980 1420 M540 700V850 M415 570V1040 M665 570V1040 M680 605H930V1150H680Z" fill="none" stroke="#d6cdb8" stroke-width="17" filter="url(#rough)"/>
+        
+        <path class="beat-blood" pathLength="1" d="M690 1530L650 1390Q610 1200 530 1090L485 955" fill="none" stroke="#a63835" stroke-width="26" stroke-linecap="round"/>
+        <g class="beat-run "><g fill="#141210" stroke="#d6cdb8" stroke-width="9"><circle cx="505" cy="620" r="43"/><path d="M475 665L540 660L595 855L450 875Z M475 862L405 1010M552 856L619 974 M535 685L650 730" stroke-linecap="round"/><circle cx="664" cy="739" r="29" fill="#f3e3b0"/></g></g>
+        
+        <path d="M478 1320q-38 25-18 94l32 8 8-24 15 8q16-53-9-79Z" fill="#b5a78f"/><circle cx="810" cy="926" r="22" fill="#a63835"/>
+        <text x="540" y="1570" text-anchor="middle" font-size="46" letter-spacing="9" fill="#e9e2d0">北廊 · 风门</text>
+      </svg>
+    </figure></div>
+    <img class="art" alt="">
+    <div class="say tail-none chase-caption">门被推开一道缝。提灯的人刚转过拐角，右脚便在雪水里打了个滑。</div>
+    <button class="hot main" data-cu="cu-heel" data-sfx="paper" style="left:37%;top:67%;width:20%;height:10%" aria-label="缺角的右鞋印"></button>
+    <button class="hot main" data-cu="cu-latch" data-sfx="paper" style="left:65%;top:43%;width:20%;height:10%" aria-label="被推开的风门"></button>
+  </div>
+</section>
+
+<section class="page chase-page" id="gate" data-index="7" data-name="雪门" data-sfx="click">
+  <div class="sheet" data-page="9">
+    <div class="panels"><figure class="panel" style="--h:1920">
+      <svg viewBox="0 0 1080 1920" aria-hidden="true">
+        <rect width="1080" height="1920" fill="#141210"/><path d="M55 120H1025V1760H55Z" fill="url(#h1)" stroke="#e9e2d0" stroke-width="7"/>
+        <path d="M90 1510L540 790L990 1510V1720H90Z" fill="url(#wood)" opacity=".64"/>
+        <path d="M265 510H815V1320H265Z M365 510V1320 M480 510V1320 M600 510V1320 M710 510V1320 M265 870H815 M485 840H600V970H485Z M535 840V785Q545 715 583 785V840" fill="none" stroke="#d6cdb8" stroke-width="17" filter="url(#rough)"/>
+        
+        
+        <g class="beat-run turn"><g fill="#141210" stroke="#d6cdb8" stroke-width="9"><circle cx="505" cy="620" r="43"/><path d="M475 665L540 660L595 855L450 875Z M475 862L405 1010M552 856L619 974 M535 685L650 730" stroke-linecap="round"/><circle cx="664" cy="739" r="29" fill="#f3e3b0"/></g></g>
+        
+        <path d="M847 980H959V1310H847Z" fill="url(#wood)" stroke="#c3b59c" stroke-width="8"/><path d="M858 1100L905 1080L883 1158Z" fill="#a63835"/>
+        <text x="540" y="1570" text-anchor="middle" font-size="46" letter-spacing="9" fill="#e9e2d0">外廊 · 铁栅</text>
+      </svg>
+    </figure></div>
+    <img class="art" alt="">
+    <div class="say tail-none chase-caption">风从铁栅里穿过去。那个人拽了两下栅门，转身躲进侧面的楼梯间。</div>
+    <button class="hot main" data-cu="cu-chain" data-sfx="paper" style="left:39%;top:41%;width:20%;height:10%" aria-label="栅门上的锁"></button>
+    <button class="hot main" data-cu="cu-scrap" data-sfx="paper" style="left:68%;top:54%;width:20%;height:10%" aria-label="挂在侧门上的碎布"></button>
+  </div>
+</section>
+
+<section class="page chase-page" id="trap" data-index="8" data-name="归席" data-sfx="paper">
+  <div class="sheet" data-page="10">
+    <div class="panels"><figure class="panel" style="--h:1920">
+      <svg viewBox="0 0 1080 1920" aria-hidden="true">
+        <rect width="1080" height="1920" fill="#141210"/><path d="M55 120H1025V1760H55Z" fill="url(#h1)" stroke="#e9e2d0" stroke-width="7"/>
+        <path d="M90 1510L540 790L990 1510V1720H90Z" fill="url(#wood)" opacity=".64"/>
+        <path d="M190 1030L900 1030L1010 1320H70Z M300 1320V1530 M800 1320V1530 M450 1020V730Q540 610 630 730V1020 M450 905H630 M500 700V1010 M580 700V1010" fill="none" stroke="#d6cdb8" stroke-width="17" filter="url(#rough)"/>
+        
+        
+        
+        <path class="beat-lamp" d="M535 935L495 1020H575Z" fill="#f3e3b0"/><circle cx="535" cy="960" r="260" fill="url(#lampglow)" opacity=".35"/>
+        <path d="M706 1098L818 1108L830 1155L743 1175Z" fill="#d6cdb8"/><path d="M725 1150l39 7" stroke="#a63835" stroke-width="12"/><path d="M523 1375H579V1420L610 1434V1462H516L529 1444H511Z" fill="#141210" stroke="#d6cdb8" stroke-width="8"/>
+        <text x="540" y="1570" text-anchor="middle" font-size="46" letter-spacing="9" fill="#e9e2d0">旧餐厅 · 熄灯前</text>
+      </svg>
+    </figure></div>
+    <img class="art" alt="">
+    <div class="say tail-none chase-caption">楼梯绕回旧餐厅。三人已围到桌前，唯有一把椅子是湿的。</div>
+    <button class="hot main" data-cu="cu-cuff" data-sfx="paper" style="left:62%;top:54%;width:20%;height:10%" aria-label="桌沿下的袖口"></button>
+    <button class="hot main" data-cu="cu-shoe" data-sfx="paper" style="left:42%;top:70%;width:20%;height:10%" aria-label="椅子下的右靴"></button>
+  </div>
+</section>
+
+<!-- ================= P10 对峙 ================= -->
+<section class="page" id="p5" data-index="9" data-name="对峙" data-sfx="snow">
+  <div class="sheet" data-page="5">
+    <div class="panels">
+      <figure class="panel" id="p5a" style="--h:560">
+        <svg viewBox="0 0 1080 560" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+          <rect width="1080" height="560" fill="#050504"/>
+          <path d="M430 0L690 0L660 110L470 110Z" fill="#e9e2d0" opacity=".9"/>
+          <path d="M470 110L660 110L650 140L480 140Z" fill="#e9e2d0" opacity=".3"/>
+          <path d="M860 0L940 0L980 170L900 170Z" fill="url(#h1)" opacity=".4"/>
+          <clipPath id="cone5"><path d="M150 100L380 100L800 560L200 560Z"/></clipPath>
+          <rect width="1080" height="560" fill="url(#snowdense)" clip-path="url(#cone5)"/>
+          <rect width="1080" height="560" fill="url(#snowdots)" clip-path="url(#cone5)" opacity=".7"/>
+          <g stroke="#e9e2d0" stroke-width="8" fill="none"><rect x="90" y="40" width="300" height="260"/><path d="M240 40V300M90 170H390"/></g>
+          <g fill="#e9e2d0" opacity=".5"><path d="M250 180L330 180L300 260Z"/><path d="M100 180L170 180L120 240Z"/><path d="M250 50L300 50L260 120Z"/><path d="M380 180L380 250L340 190Z"/></g>
+          <g stroke="#e9e2d0" stroke-width="2" opacity=".6"><path d="M270 330l40 50M300 310l70 60M200 320l-20 40"/></g>
+        </svg>
+      </figure>
+      <div class="row suspects" style="--h:718">
+        <figure class="panel suspect" id="p5b1" data-who="doctor" role="button" tabindex="0" aria-label="指认医生">
+          <svg viewBox="0 0 320 718" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="320" height="718" fill="#15130f"/><rect width="320" height="718" fill="url(#h1)" opacity=".14"/>
+            <g fill="#050504" filter="url(#rough)">
+              <circle cx="160" cy="160" r="60"/>
+              <path d="M50 718L60 330C70 250 250 250 260 330L270 718Z"/>
+              <rect x="30" y="520" width="130" height="96" rx="12"/>
+            </g>
+            <path d="M60 330C70 250 250 250 260 330" stroke="#6b655a" stroke-width="3" fill="none"/>
+            <path d="M160 100a60 60 0 0 1 60 60" stroke="#6b655a" stroke-width="3" fill="none"/>
+            <g fill="#e9e2d0" opacity=".9"><ellipse cx="136" cy="162" rx="17" ry="9"/><ellipse cx="186" cy="162" rx="17" ry="9"/></g>
+            <path d="M153 162h16" stroke="#e9e2d0" stroke-width="3"/>
+            <path d="M30 560h130" stroke="#6b655a" stroke-width="2"/>
+          </svg>
+          <span class="tag">医生</span>
+          <div class="verdict"><b>指认成立。</b>缺角的右靴和染血的袖口，把逃跑的人带回医生的座位。他用蜡线从门外扣上门闩。<span class="guilty">药箱里的牌角，与死者手中那半张的缺口吻合。</span></div>
+        </figure>
+        <figure class="panel suspect" id="p5b2" data-who="butler" role="button" tabindex="0" aria-label="指认管家">
+          <svg viewBox="0 0 320 718" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="320" height="718" fill="#15130f"/><rect width="320" height="718" fill="url(#h1)" opacity=".14"/>
+            <g fill="#050504" filter="url(#rough)">
+              <circle cx="160" cy="150" r="56"/>
+              <path d="M70 718L70 300C90 230 230 230 250 300L250 718Z"/>
+            </g>
+            <path d="M120 112C150 96 190 96 212 116" stroke="#6b655a" stroke-width="3" fill="none"/>
+            <path d="M70 300C90 230 230 230 250 300" stroke="#6b655a" stroke-width="3" fill="none"/>
+            <path d="M150 250L170 250L176 430L144 430Z" fill="#e9e2d0" opacity=".85"/>
+            <path d="M138 262L182 262L160 278Z" fill="#050504"/>
+            <ellipse cx="62" cy="440" rx="68" ry="13" fill="#6b655a"/>
+            <path d="M0 440h130" stroke="#e9e2d0" stroke-width="2" opacity=".6"/>
+          </svg>
+          <span class="tag">管家</span>
+          <div class="verdict"><b>指认未成立。</b>门闩可以从外面拨上，但能做到的人不止一个。回暗室看看，哪件私人物品同时沾着红蜡、夹着牌角？</div>
+        </figure>
+        <figure class="panel suspect" id="p5b3" data-who="heiress" role="button" tabindex="0" aria-label="指认女继承人">
+          <svg viewBox="0 0 320 718" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <rect width="320" height="718" fill="#15130f"/><rect width="320" height="718" fill="url(#h1)" opacity=".14"/>
+            <g fill="#050504" filter="url(#rough)">
+              <ellipse cx="160" cy="142" rx="112" ry="22"/><path d="M104 142C104 70 216 70 216 142Z"/>
+              <circle cx="160" cy="180" r="48"/>
+              <path d="M70 718L92 330L228 330L250 718Z"/>
+            </g>
+            <path d="M78 300L100 268L120 300L140 262L160 300L180 262L200 300L220 268L242 300L244 344L76 344Z" fill="#3b3630" filter="url(#rough)"/>
+            <path d="M50 142C80 128 240 128 270 142" stroke="#6b655a" stroke-width="3" fill="none"/>
+            <g fill="#e9e2d0" opacity=".9"><circle cx="140" cy="360" r="3"/><circle cx="150" cy="368" r="3"/><circle cx="160" cy="371" r="3"/><circle cx="170" cy="368" r="3"/><circle cx="180" cy="360" r="3"/></g>
+            <path d="M92 330L70 718M228 330L250 718" stroke="#6b655a" stroke-width="2"/>
+          </svg>
+          <span class="tag">女继承人</span>
+          <div class="verdict"><b>指认未成立。</b>信件说明继承人的处境，却不能解释药箱里的牌角。回暗室，把诊疗簿和物证一起看。</div>
+        </figure>
+      </div>
+      <figure class="panel" id="p5c" style="--h:598">
+        <svg viewBox="0 0 1080 598" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+          <rect width="1080" height="598" fill="#050504"/>
+          <circle id="p5-lamp" cx="200" cy="250" r="230" fill="url(#lampglow)" opacity=".85" style="transition:opacity .4s"/>
+          <g filter="url(#rough)">
+            <path d="M0 598L70 430C90 400 150 400 170 430L200 598Z" fill="#e9e2d0"/>
+            <path d="M0 598L70 430C90 400 150 400 170 430L200 598Z" fill="url(#h3)"/>
+            <ellipse cx="170" cy="380" rx="60" ry="52" fill="#e9e2d0"/>
+            <path d="M126 300C126 250 214 250 214 300L204 334L136 334Z" fill="#141210"/>
+            <path d="M146 254L194 254L188 172L152 172Z" fill="#f3e3b0" opacity=".95"/>
+            <path d="M168 250c-8-14-10-30 0-44c0 14 8 20 6 30c6-8 8-18 6-30c10 16 6 34-12 44z" fill="#141210"/>
+            <rect x="150" y="166" width="40" height="8" fill="#141210"/>
+          </g>
+          <path d="M120 372Q170 410 220 372M130 396Q170 426 210 396" stroke="#141210" stroke-width="3" fill="none"/>
+          <g fill="#1c1916" stroke="#6b655a" stroke-width="4" filter="url(#rough)">
+            <rect x="640" y="150" width="240" height="260" rx="10"/>
+            <rect x="620" y="400" width="300" height="40"/>
+            <rect x="640" y="440" width="20" height="158"/><rect x="860" y="440" width="20" height="158"/>
+          </g>
+          <rect x="662" y="172" width="196" height="216" fill="url(#h1)" opacity=".35"/>
+          <path d="M625 400C680 372 740 382 790 374C850 367 900 386 918 400Z" fill="#fbf8f1" filter="url(#rough)"/>
+          <g fill="#fbf8f1"><circle cx="700" cy="120" r="3"/><circle cx="760" cy="80" r="2"/><circle cx="820" cy="130" r="2.5"/><circle cx="880" cy="60" r="2"/><circle cx="960" cy="200" r="3"/><circle cx="600" cy="300" r="2"/><circle cx="1000" cy="420" r="2.5"/></g>
+        </svg>
+      </figure>
+    </div>
+    <img class="art" alt="">
+    <div class="say" style="left:46%;top:6%">灯——</div>
+    <div class="say tail-left" style="left:30%;top:73%">谁在那里？</div>
+    <div class="sfx light vert" style="right:6%;top:71%;font-size:calc(80*var(--u))">簌簌</div>
+    <div class="hot" data-action="lamp" data-nudge="p5c" data-sfx="match" style="left:4%;top:74%;width:22%;height:22%" role="button" tabindex="0" aria-label="举着灯的手"></div>
+    <div class="hot" data-cu="cu-chair" data-nudge="p5c" data-sfx="snow" style="left:58%;top:72%;width:30%;height:24%" role="button" tabindex="0" aria-label="落了雪的空椅子"></div>
+  </div>
+</section>
+</main>
+
+<canvas id="snow" aria-hidden="true"></canvas>
+<div id="grain" aria-hidden="true"></div>
+<canvas id="fx" aria-hidden="true"></canvas>
+
+<!-- ============ HUD ============ -->
+<header class="hud top">
+  <div class="brand"><h1>雪夜山庄</h1><small>竖屏互动推理漫画 · 十页连载</small></div>
+  <div class="tools">
+    <span class="clue-progress" role="status" aria-live="polite">线索 <b id="clueCount">0</b>/<span id="clueTotal">0</span></span>
+    <button class="btn" id="soundBtn" aria-pressed="false">声音 关</button>
+    <button class="btn" id="makerBtn" aria-pressed="false">制作台</button>
+  </div>
+</header>
+<footer class="hud bottom">
+  <div class="pageline"><b id="pgName">P1 · 抵达</b><span class="dots" id="pgDots"><i class="on"></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span></div>
+  <button class="btn blood" id="redo">重新指认</button>
+  <div class="hint" id="hint">向下滚动翻页 · 画面中的发光处藏着线索</div>
+</footer>
+<nav class="rail" aria-label="页码">
+  <button data-go="0" class="on">抵达</button><button data-go="1">大厅</button><button data-go="2">第一具尸体</button><button data-go="3">搜查</button><button data-go="4">暗室</button><button data-go="5">渗痕</button><button data-go="6">北廊</button><button data-go="7">雪门</button><button data-go="8">归席</button><button data-go="9">对峙</button>
+</nav>
+<div class="toast" id="toast" role="status"></div>
+
+<!-- ============ close-up dialog ============ -->
+<dialog id="closeup" aria-label="特写格">
+  <div class="cu-wrap">
+    <div class="cu-frame" id="cuFrame">
+      <span class="cu-title" id="cuTitle"></span>
+      <button class="cu-close" id="cuClose">关闭 ✕</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- ============ close-up templates ============ -->
+<template id="cu-hand" data-title="车内视角">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="#141210"/>
+    <rect width="600" height="800" fill="url(#h1)" opacity=".25"/>
+    <rect x="80" y="120" width="440" height="420" rx="20" fill="url(#dots)"/>
+    <clipPath id="wipe"><g transform="translate(300 330) rotate(-12) scale(1.7)"><ellipse cx="0" cy="20" rx="46" ry="54"/><ellipse cx="-50" cy="-6" rx="12" ry="30" transform="rotate(-35 -50 -6)"/><ellipse cx="-22" cy="-62" rx="11" ry="40"/><ellipse cx="4" cy="-72" rx="11" ry="44"/><ellipse cx="30" cy="-64" rx="11" ry="40"/><ellipse cx="52" cy="-40" rx="10" ry="32"/></g></clipPath>
+    <g clip-path="url(#wipe)">
+      <rect width="600" height="800" fill="#0a0908"/>
+      <rect width="600" height="800" fill="url(#snowdots)"/>
+      <path d="M100 400L240 330L300 360L420 300L520 330L600 290L600 540L100 540Z" fill="url(#h1)"/>
+      <g fill="#050504"><path d="M300 330L300 250L350 200L400 250L400 330Z"/><rect x="400" y="260" width="120" height="70"/><rect x="330" y="160" width="16" height="60"/></g>
+      <rect x="430" y="280" width="14" height="20" fill="#f3e3b0"/>
+    </g>
+    <path d="M440 800L380 600C420 560 520 580 540 620L600 800Z" fill="#0a0908" filter="url(#rough)"/>
+    <path d="M400 640c30-10 70 0 100 20" stroke="#6b655a" stroke-width="3" fill="none"/>
+    <rect x="80" y="120" width="440" height="420" rx="20" fill="none" stroke="#e9e2d0" stroke-width="10"/>
+  </svg>
+  <p class="cap left lo">车里，只有一个人的呼吸。</p>
+</template>
+<template id="cu-print" data-title="脚印">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="#e9e2d0"/><rect width="600" height="800" fill="url(#snowfaint)"/>
+    <g fill="#141210" filter="url(#rough)"><use href="#fp" x="200" y="200" width="200" height="440"/></g>
+    <path d="M160 300C240 260 360 250 460 300L470 420C380 360 230 360 150 420Z" fill="#e9e2d0" filter="url(#rough)"/>
+    <path d="M150 420c80-50 230-50 320 0" stroke="#141210" stroke-width="3" fill="none" opacity=".6"/>
+    <g stroke="#141210" stroke-width="2" opacity=".35"><path d="M60 700l120-30M400 720l140-20M80 120l100-10"/></g>
+  </svg>
+  <p class="cap">雪还在下。这行脚印不到半小时。</p>
+</template>
+<template id="cu-letter" data-title="未拆的信">
+  <svg viewBox="0 0 600 800" aria-hidden="true"><rect width="600" height="800" fill="#141210"/><rect width="600" height="800" fill="url(#wood)" opacity=".5"/></svg>
+  <div class="letter">
+    <span>致各位来客：</span>
+    <span>今夜十一点四十七分，</span>
+    <span>请务必留在大厅，</span>
+    <span>不要上楼。</span>
+    <span class="sig">——R</span>
+    <span class="seal"></span>
+  </div>
+</template>
+<template id="cu-clock" data-title="挂钟">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="#141210"/>
+    <circle cx="300" cy="400" r="240" fill="#e9e2d0" filter="url(#rough)"/>
+    <g stroke="#141210" stroke-width="10"><path d="M300 180v40" transform="rotate(0 300 400)"/><path d="M300 180v40" transform="rotate(30 300 400)"/><path d="M300 180v40" transform="rotate(60 300 400)"/><path d="M300 180v40" transform="rotate(90 300 400)"/><path d="M300 180v40" transform="rotate(120 300 400)"/><path d="M300 180v40" transform="rotate(150 300 400)"/><path d="M300 180v40" transform="rotate(180 300 400)"/><path d="M300 180v40" transform="rotate(210 300 400)"/><path d="M300 180v40" transform="rotate(240 300 400)"/><path d="M300 180v40" transform="rotate(270 300 400)"/><path d="M300 180v40" transform="rotate(300 300 400)"/><path d="M300 180v40" transform="rotate(330 300 400)"/></g>
+    <path d="M300 400V250" stroke="#141210" stroke-width="18" stroke-linecap="round" transform="rotate(-6 300 400)"/>
+    <path d="M300 400V200" stroke="#141210" stroke-width="9" stroke-linecap="round" transform="rotate(282 300 400)"/>
+    <circle cx="300" cy="400" r="16" fill="#141210"/>
+    <path d="M140 300l90 80l-20 40l60 30l-10 50" stroke="#141210" stroke-width="3" fill="none"/>
+    <circle cx="300" cy="400" r="240" fill="none" stroke="#141210" stroke-width="14"/>
+  </svg>
+  <p class="cap lo">停摆的钟不会说谎，它只是沉默。</p>
+</template>
+<template id="cu-cloak" data-title="斗篷">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="#141210"/>
+    <path d="M60 220C80 120 520 110 540 220L600 760C420 680 200 700 0 780Z" fill="#141210" stroke="#e9e2d0" stroke-width="6" filter="url(#rough)"/>
+    <path d="M60 220C80 120 520 110 540 220L600 760C420 680 200 700 0 780Z" fill="url(#h1)" opacity=".5"/>
+    <path d="M200 240C180 400 150 560 100 720M400 230C430 400 470 560 540 700M300 236C296 420 304 580 320 720" stroke="#e9e2d0" stroke-width="4" fill="none"/>
+    <g fill="#fbf8f1"><circle cx="150" cy="260" r="8"/><circle cx="230" cy="210" r="6"/><circle cx="330" cy="200" r="9"/><circle cx="420" cy="240" r="6"/><circle cx="180" cy="360" r="5"/><circle cx="470" cy="340" r="7"/><circle cx="280" cy="300" r="4"/><circle cx="500" cy="480" r="6"/><circle cx="110" cy="480" r="5"/><circle cx="360" cy="420" r="5"/></g>
+  </svg>
+  <p class="cap">雪没有化。他进门，不到十分钟。</p>
+</template>
+<template id="cu-lock" data-title="门闩">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="url(#wood)"/><rect width="600" height="800" fill="#141210" opacity=".35"/>
+    <g filter="url(#rough)">
+      <rect x="0" y="280" width="70" height="240" fill="#141210"/>
+      <rect x="60" y="320" width="400" height="170" fill="#141210"/>
+      <rect x="120" y="370" width="380" height="70" rx="35" fill="#e9e2d0"/>
+      <rect x="0" y="370" width="130" height="70" rx="12" fill="#e9e2d0"/>
+      <circle cx="440" cy="405" r="22" fill="#141210"/>
+    </g>
+    <path d="M150 390l60-12M160 420l60-12M300 384l40-8" stroke="#141210" stroke-width="4"/>
+    <path d="M120 560l100 90M160 540l90 70" stroke="#141210" stroke-width="4"/>
+  </svg>
+  <p class="cap lo">门闩从里面扣上，拨片上有新鲜的划痕。</p>
+</template>
+<template id="cu-ice" data-title="冰花">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="#0a0908"/>
+    <g stroke="#e9e2d0" fill="none" stroke-width="4" stroke-linecap="round" filter="url(#rough2)">
+      <use href="#ice" x="0" y="100" width="320" height="400"/>
+      <use href="#ice" x="0" y="380" width="320" height="420" transform="scale(1 -1) translate(0 -1180)"/>
+      <use href="#ice" x="280" y="100" width="320" height="400" transform="scale(-1 1) translate(-880 0)"/>
+      <use href="#ice" x="280" y="380" width="320" height="420" transform="scale(-1 -1) translate(-880 -1180)"/>
+      <use href="#ice" x="160" y="300" width="200" height="200" transform="rotate(35 260 400)"/>
+    </g>
+    <path d="M300 0V800M0 400H600" stroke="#e9e2d0" stroke-width="14"/>
+  </svg>
+  <p class="cap left">冰花长在玻璃内侧。屋里，比外面还冷。</p>
+</template>
+<template id="cu-card" data-title="半张牌">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="#141210"/><rect width="600" height="800" fill="url(#h1)" opacity=".25"/>
+    <g transform="translate(300 420) rotate(-10)" filter="url(#rough2)">
+      <path d="M-150 -240L150 -240L150 60L90 110L40 60L-10 120L-60 70L-150 120Z" fill="#fbf8f1" stroke="#141210" stroke-width="8"/>
+      <text x="-124" y="-150" font-family="Georgia,serif" font-size="96" font-weight="700" fill="#141210">Q</text>
+      <path d="M-96 -110C-96 -110 -52 -66 -52 -40A20 20 0 0 1 -88 -30L-74 -4L-118 -4L-104 -30A20 20 0 0 1 -140 -40C-140 -66 -96 -110 -96 -110Z" fill="#141210"/>
+      <circle cx="60" cy="-80" r="38" fill="#6e1212"/>
+      <path d="M36 -94c10 10 36 10 48 0M38 -76c10 8 34 8 44 0M44 -60c8 6 26 6 32 0" stroke="#fbf8f1" stroke-width="2.5" fill="none" opacity=".55"/>
+    </g>
+  </svg>
+  <p class="cap lo">黑桃Q，撕掉了一半。指印，是血。</p>
+</template>
+<template id="cu-door" data-title="三号房">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="#141210"/>
+    <rect x="80" y="40" width="440" height="760" fill="url(#wood)"/><rect x="80" y="40" width="440" height="760" fill="#141210" opacity=".45"/>
+    <rect x="80" y="40" width="440" height="760" fill="none" stroke="#e9e2d0" stroke-width="12"/>
+    <rect x="130" y="100" width="340" height="240" fill="none" stroke="#141210" stroke-width="10"/>
+    <rect x="130" y="420" width="340" height="320" fill="none" stroke="#141210" stroke-width="10"/>
+    <text x="260" y="250" fill="#e9e2d0" font-family="Georgia,serif" font-size="120" font-weight="700">3</text>
+    <circle cx="450" cy="470" r="18" fill="#e9e2d0"/>
+    <path d="M160 500l80 90M190 480l70 70M150 560l60 60" stroke="#e9e2d0" stroke-width="4"/>
+    <path d="M0 800L80 760L80 600L0 640Z" fill="#f3e3b0" opacity=".8"/>
+  </svg>
+  <p class="cap left">三号房。门没有锁，门框下沿有抓痕。</p>
+</template>
+<template id="cu-snow" data-title="俯视放大">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="#e9e2d0"/><rect width="600" height="800" fill="url(#snowfaint)"/>
+    <g stroke="#141210" stroke-width="1.5" opacity=".25"><path d="M0 100H600M0 200H600M0 300H600M0 400H600M0 500H600M0 600H600M0 700H600M100 0V800M200 0V800M300 0V800M400 0V800M500 0V800"/></g>
+    <g fill="#141210" filter="url(#rough)">
+      <use href="#fp" x="90" y="40" width="60" height="130" transform="rotate(150 120 105)"/>
+      <use href="#fp" x="190" y="130" width="60" height="130" transform="rotate(150 220 195)"/>
+      <use href="#fp" x="230" y="290" width="60" height="130" transform="rotate(150 260 355)"/>
+      <use href="#fp" x="330" y="380" width="60" height="130" transform="rotate(150 360 445)"/>
+      <use href="#fp" x="370" y="540" width="60" height="130" transform="rotate(150 400 605)" opacity=".5"/>
+    </g>
+    <g stroke="#141210" stroke-width="3" fill="none"><path d="M60 740H360M60 728v24M360 728v24M210 734v12"/></g>
+    <text x="210" y="775" font-family="Georgia,serif" font-size="22" text-anchor="middle" fill="#141210">1 m</text>
+    <path d="M430 620c20-20 60-30 100-20" stroke="#6e1212" stroke-width="3" fill="none" stroke-dasharray="8 8"/>
+  </svg>
+  <p class="cap">步幅六十二厘米。最后一步，没有落地。</p>
+</template>
+<template id="cu-shelf" data-title="暗格">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="url(#wood)"/><rect width="600" height="800" fill="#141210" opacity=".5"/>
+    <g fill="#141210" stroke="#e9e2d0" stroke-width="5"><rect x="20" y="60" width="60" height="240"/><rect x="90" y="90" width="50" height="210"/><rect x="150" y="50" width="70" height="250"/><rect x="430" y="80" width="60" height="220"/><rect x="500" y="60" width="80" height="240"/></g>
+    <rect x="0" y="300" width="600" height="30" fill="#141210"/>
+    <rect x="230" y="60" width="190" height="240" fill="#0a0908"/>
+    <rect x="230" y="60" width="190" height="240" fill="url(#h1)" opacity=".2"/>
+    <g transform="translate(325 200) rotate(14)" filter="url(#rough2)">
+      <path d="M-70 -100L70 -100L70 30L30 -10L0 40L-30 0L-70 30Z" fill="#fbf8f1" stroke="#141210" stroke-width="5" transform="scale(1 -1)"/>
+      <text x="26" y="88" font-family="Georgia,serif" font-size="44" font-weight="700" fill="#141210" transform="rotate(180 46 72)">Q</text>
+    </g>
+    <path d="M0 800L600 800L600 520L0 560Z" fill="#141210"/>
+    <path d="M400 500l120 60" stroke="#f3e3b0" stroke-width="6" opacity=".9"/>
+  </svg>
+  <p class="cap left lo">暗格里，躺着另外半张牌。</p>
+</template>
+<template id="cu-chair" data-title="空椅子">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="#050504"/>
+    <circle cx="80" cy="200" r="260" fill="url(#lampglow)" opacity=".7"/>
+    <g fill="#1c1916" stroke="#6b655a" stroke-width="6" filter="url(#rough)">
+      <rect x="140" y="120" width="320" height="340" rx="14"/>
+      <rect x="110" y="450" width="380" height="50"/>
+      <rect x="140" y="500" width="28" height="300"/><rect x="432" y="500" width="28" height="300"/>
+    </g>
+    <rect x="170" y="150" width="260" height="280" fill="url(#h1)" opacity=".35"/>
+    <path d="M114 450C180 416 260 428 320 420C400 410 460 432 488 450Z" fill="#fbf8f1" filter="url(#rough)"/>
+    <g fill="#fbf8f1"><circle cx="200" cy="60" r="4"/><circle cx="300" cy="30" r="3"/><circle cx="420" cy="80" r="3.5"/><circle cx="520" cy="300" r="3"/><circle cx="60" cy="600" r="3"/></g>
+  </svg>
+  <p class="cap left">椅面上的雪，还没化。有人刚刚起身。</p>
+</template>
+
+<template id="cu-ledger" data-title="诊疗簿">
+  <svg viewBox="0 0 1080 625" preserveAspectRatio="xMidYMid slice" aria-hidden="true"><rect width="1080" height="625" fill="url(#wood)"/><rect width="1080" height="625" fill="#141210" opacity=".62"/><g transform="rotate(-6 540 310)" filter="url(#rough)"><path d="M290 110H510L540 135L570 110H790V420H570L540 445L510 420H290Z M540 135V445" fill="url(#h2)" stroke="#141210" stroke-width="14"/><path d="M330 220H495M330 265H495M590 220H745M590 265H745M595 321H745" fill="none" stroke="#6e1212" stroke-width="12"/></g><text x="540" y="550" text-anchor="middle" font-size="46" fill="#fbf8f1">诊疗簿</text></svg>
+  <p class="cap lo">十一点四十七分，医生独自领取药箱。死者此前划掉了一笔由医生代领的药款。</p>
+</template>
+<template id="cu-thread" data-title="门闩试拨">
+  <svg viewBox="0 0 1080 625" preserveAspectRatio="xMidYMid slice" aria-hidden="true"><rect width="1080" height="625" fill="url(#wood)"/><rect width="1080" height="625" fill="#141210" opacity=".62"/><g transform="rotate(0 540 310)" filter="url(#rough)"><path d="M300 170H780V340H300Z M360 250H710 M670 190V310" fill="url(#h2)" stroke="#141210" stroke-width="14"/><path d="M750 340Q840 430 550 430T325 350" fill="none" stroke="#6e1212" stroke-width="12"/></g><text x="540" y="550" text-anchor="middle" font-size="46" fill="#fbf8f1">门闩试拨</text></svg>
+  <p class="cap lo">细蜡线能从门底牵动门闩，锁好后可从外面抽走。现场划痕里也有红蜡。</p>
+</template>
+<template id="cu-kit" data-title="医生的药箱">
+  <svg viewBox="0 0 1080 625" preserveAspectRatio="xMidYMid slice" aria-hidden="true"><rect width="1080" height="625" fill="url(#wood)"/><rect width="1080" height="625" fill="#141210" opacity=".62"/><g transform="rotate(6 540 310)" filter="url(#rough)"><path d="M440 195V110H640V195 M270 195H810V445H270Z M270 280H810 M500 250H580V345H500Z" fill="url(#h2)" stroke="#141210" stroke-width="14"/><path d="M570 268l65-37-10 80z" fill="none" stroke="#6e1212" stroke-width="12"/></g><text x="540" y="550" text-anchor="middle" font-size="46" fill="#fbf8f1">医生的药箱</text></svg>
+  <p class="cap lo">药箱搭扣上缠着同色蜡线。夹缝里的黑桃牌角，与死者手里那半张的缺口吻合。</p>
+</template>
+
+<template id="cu-seam" data-title="夹在柜底的布条">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="url(#h1)"/>
+    <rect x="68" y="88" width="464" height="605" fill="#e9e2d0" filter="url(#rough)"/>
+    <svg x="55" y="164" width="360" height="380" viewBox="0 400 1080 1150"><path d="M240 590H840V1050H240Z M240 760H840 M420 590V760 M660 590V760 M460 690H620 M490 690V745H590V690" fill="none" stroke="#141210" stroke-width="34"/><path d="M465 900q160 90 40 240" fill="none" stroke="#6e1212" stroke-width="32"/></svg>
+    <text x="105" y="158" fill="#141210" font-size="30">夹在柜底的布条</text>
+  </svg>
+  <p class="cap lo">布条有新鲜血迹，边缘绣着药箱上的十字。有人把染血的袖口扯断，塞进了柜底。</p>
+</template>
+<template id="cu-trail" data-title="地板缝里的血迹">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="url(#h1)"/>
+    <rect x="68" y="88" width="464" height="605" fill="#e9e2d0" filter="url(#rough)"/>
+    <svg x="55" y="164" width="360" height="380" viewBox="0 400 1080 1150"><path d="M240 590H840V1050H240Z M240 760H840 M420 590V760 M660 590V760 M460 690H620 M490 690V745H590V690" fill="none" stroke="#141210" stroke-width="34"/><path d="M610 980l120 80-105 100z" fill="none" stroke="#6e1212" stroke-width="32"/></svg>
+    <text x="105" y="158" fill="#141210" font-size="30">地板缝里的血迹</text>
+  </svg>
+  <p class="cap lo">血迹从柜脚往北廊延伸。血点之间夹着浅鞋印，右跟缺了一小块。</p>
+</template>
+<template id="cu-heel" data-title="缺角的右鞋印">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="url(#h1)"/>
+    <rect x="68" y="88" width="464" height="605" fill="#e9e2d0" filter="url(#rough)"/>
+    <svg x="55" y="164" width="360" height="380" viewBox="0 400 1080 1150"><path d="M100 420L540 700L980 420 M100 1420L540 850L980 1420 M540 700V850 M415 570V1040 M665 570V1040 M680 605H930V1150H680Z" fill="none" stroke="#141210" stroke-width="34"/><path d="M465 900q160 90 40 240" fill="none" stroke="#6e1212" stroke-width="32"/></svg>
+    <text x="105" y="158" fill="#141210" font-size="30">缺角的右鞋印</text>
+  </svg>
+  <p class="cap lo">门边湿鞋印的右后跟缺了一角，与暗室血迹旁的鞋印一致。</p>
+</template>
+<template id="cu-latch" data-title="被推开的风门">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="url(#h1)"/>
+    <rect x="68" y="88" width="464" height="605" fill="#e9e2d0" filter="url(#rough)"/>
+    <svg x="55" y="164" width="360" height="380" viewBox="0 400 1080 1150"><path d="M100 420L540 700L980 420 M100 1420L540 850L980 1420 M540 700V850 M415 570V1040 M665 570V1040 M680 605H930V1150H680Z" fill="none" stroke="#141210" stroke-width="34"/><path d="M610 980l120 80-105 100z" fill="none" stroke="#6e1212" stroke-width="32"/></svg>
+    <text x="105" y="158" fill="#141210" font-size="30">被推开的风门</text>
+  </svg>
+  <p class="cap lo">门把手上有血。门后只有一道外廊，尽头是锁住的铁栅。</p>
+</template>
+<template id="cu-chain" data-title="栅门上的锁">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="url(#h1)"/>
+    <rect x="68" y="88" width="464" height="605" fill="#e9e2d0" filter="url(#rough)"/>
+    <svg x="55" y="164" width="360" height="380" viewBox="0 400 1080 1150"><path d="M265 510H815V1320H265Z M365 510V1320 M480 510V1320 M600 510V1320 M710 510V1320 M265 870H815 M485 840H600V970H485Z M535 840V785Q545 715 583 785V840" fill="none" stroke="#141210" stroke-width="34"/><path d="M465 900q160 90 40 240" fill="none" stroke="#6e1212" stroke-width="32"/></svg>
+    <text x="105" y="158" fill="#141210" font-size="30">栅门上的锁</text>
+  </svg>
+  <p class="cap lo">锁芯里积着一层干雪，没被钥匙碰过。逃跑的人没出山庄。</p>
+</template>
+<template id="cu-scrap" data-title="挂在侧门上的碎布">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="url(#h1)"/>
+    <rect x="68" y="88" width="464" height="605" fill="#e9e2d0" filter="url(#rough)"/>
+    <svg x="55" y="164" width="360" height="380" viewBox="0 400 1080 1150"><path d="M265 510H815V1320H265Z M365 510V1320 M480 510V1320 M600 510V1320 M710 510V1320 M265 870H815 M485 840H600V970H485Z M535 840V785Q545 715 583 785V840" fill="none" stroke="#141210" stroke-width="34"/><path d="M610 980l120 80-105 100z" fill="none" stroke="#6e1212" stroke-width="32"/></svg>
+    <text x="105" y="158" fill="#141210" font-size="30">挂在侧门上的碎布</text>
+  </svg>
+  <p class="cap lo">侧门钉上挂着一小片深色袖布。往上只有一段楼梯，通到楼上的旧餐厅。</p>
+</template>
+<template id="cu-cuff" data-title="桌沿下的袖口">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="url(#h1)"/>
+    <rect x="68" y="88" width="464" height="605" fill="#e9e2d0" filter="url(#rough)"/>
+    <svg x="55" y="164" width="360" height="380" viewBox="0 400 1080 1150"><path d="M190 1030L900 1030L1010 1320H70Z M300 1320V1530 M800 1320V1530 M450 1020V730Q540 610 630 730V1020 M450 905H630 M500 700V1010 M580 700V1010" fill="none" stroke="#141210" stroke-width="34"/><path d="M465 900q160 90 40 240" fill="none" stroke="#6e1212" stroke-width="32"/></svg>
+    <text x="105" y="158" fill="#141210" font-size="30">桌沿下的袖口</text>
+  </svg>
+  <p class="cap lo">医生把右手压在桌沿下。袖口缺了一角，露出的绷带有新血；布纹与侧门碎布吻合。</p>
+</template>
+<template id="cu-shoe" data-title="椅子下的右靴">
+  <svg viewBox="0 0 600 800" aria-hidden="true">
+    <rect width="600" height="800" fill="url(#h1)"/>
+    <rect x="68" y="88" width="464" height="605" fill="#e9e2d0" filter="url(#rough)"/>
+    <svg x="55" y="164" width="360" height="380" viewBox="0 400 1080 1150"><path d="M190 1030L900 1030L1010 1320H70Z M300 1320V1530 M800 1320V1530 M450 1020V730Q540 610 630 730V1020 M450 905H630 M500 700V1010 M580 700V1010" fill="none" stroke="#141210" stroke-width="34"/><path d="M610 980l120 80-105 100z" fill="none" stroke="#6e1212" stroke-width="32"/></svg>
+    <text x="105" y="158" fill="#141210" font-size="30">椅子下的右靴</text>
+  </svg>
+  <p class="cap lo">右靴缺了一角，鞋沿还有半化的雪。北廊的足迹到这张椅子下就断了。</p>
+</template>
+
+<!-- ============ maker drawer ============ -->
+<aside id="maker" aria-label="制作台">
+  <div class="mk-head"><h2>制作台</h2><button class="btn" id="makerClose">收起</button></div>
+  <p>这里的十页是木刻风分镜稿。把 AI 出的 1080×2060 成图拖进对应页，网页会自动按上下各 70px 的拼接余量裁切；热区、过场、音效都在图层之上，不烧进画面。</p>
+
+  <h3>显示</h3>
+  <div class="toggles">
+    <button class="btn" id="tgHot" aria-pressed="false">显示热区边界</button>
+    <button class="btn" id="tgFx" aria-pressed="true">过场动画 开</button>
+    <button class="btn" id="tgBoard" aria-pressed="false">换图后仍看分镜稿</button>
+    <button class="btn" id="tgSnow" aria-pressed="true">共享雪纹层 开</button>
+  </div>
+
+  <h3>换图 · 十页成图</h3>
+  <div id="slots"></div>
+  <p style="margin-top:8px">图片只存在你这台浏览器里，不会上传。也可以直接把图片拖到漫画页上。</p>
+
+  <h3>分页提示词 · Midjourney</h3>
+  <div id="prompts"></div>
+
+  <h3>过场动画 · 即梦 / 可灵 运动提示词</h3>
+  <div id="transPrompts"></div>
+
+  <h3>负面提示词</h3>
+  <div class="prompt"><div class="pt"><span>--no</span><button class="copy" data-copy="neg">复制</button></div><pre id="negPrompt">anime, moe style, color gradient, 3d render, smooth vector lines, modern objects, phone, car, LED, page border, page number, watermark, text, speech bubble, sound effect lettering, garbled text, typos, extra fingers, extra limbs, frontal face close-up, repeated composition</pre><div class="cn">不要日系萌系、彩色渐变、3D 渲染、光滑矢量线、现代物件、页边框页码水印；不要生成文字、对白框或拟声词，统一交给网页叠加；避免多余手指肢体、人物正脸大特写和每页构图雷同。</div></div>
+
+  <h3>参数</h3>
+  <div class="prompt"><div class="pt"><span>尺寸与后缀</span><button class="copy" data-copy="params">复制</button></div><pre id="paramsText">1080×1920 (9:16) 展示；每页出图 1080×2060，上下各多 70px 作拼接余量
+Midjourney 后缀：--ar 9:16 --style raw --s 250
+风格词：woodcut print, comic panel layout, high-contrast black and white, coarse halftone, aged paper grain, single dark blood red accent
+图生视频：把过场段落单独作为运动提示词，运镜写「缓慢推进，不摇不晃」</pre></div>
+
+  <h3>热区坐标</h3>
+  <div class="prompt"><div class="pt"><span>导出 JSON（百分比，基于 1080×1920）</span><button class="copy" data-copy="hot">复制</button></div><pre id="hotJson"></pre></div>
+</aside>
+
+<script>
+(function(){
+'use strict';
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
+const stage=$('#stage'), pages=$$('.page');
+const settings={sound:false,fx:!reduced,snow:true};
+const pixelRatio=()=>Math.min(devicePixelRatio||1,2);
+let active=0, pick=null;
+
+/* ---------- sizing: one design unit = sheet height / 1920 ---------- */
+function fit(){
+  const h=stage.clientHeight, w=stage.clientWidth;
+  const sh=Math.min(h, w*16/9);
+  document.documentElement.style.setProperty('--sh', sh+'px');
+}
+addEventListener('resize',fit); fit();
+
+/* ---------- toast ---------- */
+let toastT;
+function toast(msg){ const t=$('#toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove('show'),1800); }
+
+/* ---------- audio: small synthesized woodcut sounds ---------- */
+const Audio={
+  ctx:null,
+  ensure(){ if(!this.ctx){ const C=window.AudioContext||window.webkitAudioContext; if(!C) return false; this.ctx=new C(); } if(this.ctx.state==='suspended') this.ctx.resume(); return true; },
+  noise(d){ const c=this.ctx, b=c.createBuffer(1,Math.ceil(c.sampleRate*d),c.sampleRate), a=b.getChannelData(0); for(let i=0;i<a.length;i++) a[i]=Math.random()*2-1; const s=c.createBufferSource(); s.buffer=b; return s; },
+  play(name){
+    if(!settings.sound||!this.ensure()) return;
+    const c=this.ctx, t=c.currentTime, out=c.createGain(); out.connect(c.destination);
+    const env=(g,peak,a,d)=>{ g.gain.setValueAtTime(0.0001,t); g.gain.linearRampToValueAtTime(peak,t+a); g.gain.exponentialRampToValueAtTime(0.0001,t+a+d); };
+    switch(name){
+      case 'wind':{ const s=this.noise(2.6), f=c.createBiquadFilter(); f.type='lowpass'; f.Q.value=1.2; f.frequency.setValueAtTime(260,t); f.frequency.linearRampToValueAtTime(900,t+1.3); f.frequency.linearRampToValueAtTime(220,t+2.6); s.connect(f).connect(out); out.gain.setValueAtTime(0,t); out.gain.linearRampToValueAtTime(.32,t+.9); out.gain.linearRampToValueAtTime(0,t+2.6); s.start(t); break; }
+      case 'paper':{ const s=this.noise(.4), f=c.createBiquadFilter(); f.type='bandpass'; f.frequency.value=2600; f.Q.value=.8; s.connect(f).connect(out); env(out,.35,.02,.35); s.start(t); break; }
+      case 'tick':{ [0,.52].forEach(dt=>{ const o=c.createOscillator(), g=c.createGain(); o.type='square'; o.frequency.value=1800; o.connect(g).connect(out); g.gain.setValueAtTime(.25,t+dt); g.gain.exponentialRampToValueAtTime(.0001,t+dt+.05); o.start(t+dt); o.stop(t+dt+.06); }); break; }
+      case 'thud':{ const o=c.createOscillator(), g=c.createGain(); o.type='sine'; o.frequency.setValueAtTime(90,t); o.frequency.exponentialRampToValueAtTime(38,t+.5); o.connect(g).connect(out); env(g,.9,.01,.6); o.start(t); o.stop(t+.7); const s=this.noise(.2), f=c.createBiquadFilter(), g2=c.createGain(); f.type='lowpass'; f.frequency.value=500; s.connect(f).connect(g2).connect(out); env(g2,.5,.005,.18); s.start(t); break; }
+      case 'crack':{ for(let i=0;i<7;i++){ const dt=i*.07+Math.random()*.05, s=this.noise(.05), f=c.createBiquadFilter(), g=c.createGain(); f.type='highpass'; f.frequency.value=2500+Math.random()*2000; s.connect(f).connect(g).connect(out); g.gain.setValueAtTime(.4,t+dt); g.gain.exponentialRampToValueAtTime(.0001,t+dt+.05); s.start(t+dt);} break; }
+      case 'click':{ const o=c.createOscillator(), g=c.createGain(); o.type='square'; o.frequency.value=700; o.connect(g).connect(out); g.gain.setValueAtTime(.3,t); g.gain.exponentialRampToValueAtTime(.0001,t+.035); o.start(t); o.stop(t+.04); break; }
+      case 'snow':{ const s=this.noise(2), f=c.createBiquadFilter(); f.type='lowpass'; f.frequency.value=1400; s.connect(f).connect(out); out.gain.setValueAtTime(0,t); out.gain.linearRampToValueAtTime(.12,t+.6); out.gain.linearRampToValueAtTime(0,t+2); s.start(t); break; }
+      case 'match':{ const s=this.noise(.7), f=c.createBiquadFilter(); f.type='bandpass'; f.frequency.setValueAtTime(3200,t); f.frequency.exponentialRampToValueAtTime(600,t+.6); f.Q.value=1.5; s.connect(f).connect(out); env(out,.4,.06,.6); s.start(t); break; }
+    }
+  }
+};
+$('#soundBtn').addEventListener('click',e=>{ settings.sound=!settings.sound; e.currentTarget.setAttribute('aria-pressed',settings.sound); e.currentTarget.textContent=settings.sound?'声音 开':'声音 关'; if(settings.sound){ Audio.ensure(); Audio.play(pages[active].dataset.sfx); } });
+
+/* ---------- navigation & active page ---------- */
+const dots=$$('#pgDots i'), rail=$$('.rail button');
+function setActive(i){
+  if(i===active) return;
+  const prev=active; active=i;
+  pages[prev].classList.remove('is-reading');
+  pages[i].classList.add('is-reading');
+  $('#pgName').textContent=`P${i+1} · ${pages[i].dataset.name}`;
+  dots.forEach((d,k)=>d.classList.toggle('on',k===i));
+  rail.forEach((b,k)=>b.classList.toggle('on',k===i));
+  if(Math.abs(prev-i)===1) runTransition(prev,i);
+  $('#hint').classList.add('gone');
+}
+const io=new IntersectionObserver(es=>{ es.forEach(e=>{ if(e.isIntersecting&&e.intersectionRatio>=.6) setActive(+e.target.dataset.index); }); },{root:stage,threshold:[.6]});
+pages.forEach(p=>io.observe(p));
+rail.forEach(b=>b.addEventListener('click',()=>pages[+b.dataset.go].scrollIntoView({behavior:reduced?'auto':'smooth'})));
+setTimeout(()=>$('#hint').classList.add('gone'),7000);
+
+/* ---------- hotspots ---------- */
+function nudge(id){ const p=document.getElementById(id); if(!p) return; p.classList.add('pushed'); setTimeout(()=>p.classList.remove('pushed'),650); }
+function openCloseup(id){
+  const tpl=document.getElementById(id); if(!tpl) return;
+  const frame=$('#cuFrame');
+  frame.querySelectorAll(':scope > :not(.cu-title):not(.cu-close)').forEach(n=>n.remove());
+  frame.appendChild(tpl.content.cloneNode(true));
+  $('#cuTitle').textContent=tpl.dataset.title||'';
+  const dlg=$('#closeup'); if(!dlg.open) dlg.showModal();
+}
+$('#cuClose').addEventListener('click',()=>$('#closeup').close());
+$('#closeup').addEventListener('click',e=>{ if(e.target.id==='closeup'||e.target.classList.contains('cu-wrap')) e.currentTarget.close(); });
+
+const actions={
+  window(){ const w=$('#p1-window'); w.setAttribute('opacity','1'); setTimeout(()=>w.setAttribute('opacity','0'),1600); toast('二楼，亮了一盏灯。'); },
+  lamp(){ const l=$('#p5-lamp'); l.setAttribute('opacity','1'); l.setAttribute('r','330'); setTimeout(()=>{ l.setAttribute('opacity','.85'); l.setAttribute('r','230'); },900); toast('火苗抖了一下。'); }
+};
+function fireHot(h){
+  if(h.dataset.cu&&!h.classList.contains('found')){
+    h.classList.add('found');
+    h.dataset.found='true';
+    foundClues.add(h.dataset.cu);
+    $('#clueCount').textContent=foundClues.size;
+    toast(`发现线索 · ${h.getAttribute('aria-label')}`);
+  }
+  if(h.dataset.nudge) nudge(h.dataset.nudge);
+  if(h.dataset.sfx) Audio.play(h.dataset.sfx);
+  if(h.dataset.cu) openCloseup(h.dataset.cu);
+  if(h.dataset.action&&actions[h.dataset.action]) actions[h.dataset.action]();
+}
+const clueHots=$$('.hot[data-cu]'), foundClues=new Set();
+$('#clueTotal').textContent=new Set(clueHots.map(h=>h.dataset.cu)).size;
+$$('.hot').forEach(h=>{
+  h.addEventListener('click',()=>fireHot(h));
+  h.addEventListener('keydown',e=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); fireHot(h); } });
+});
+
+/* ---------- P5 accusation: the row re-lays itself into a verdict panel ---------- */
+const sheet5=$('#p5 .sheet'), redo=$('#redo');
+function accuse(who,silent){
+  const missing=['cu-ledger','cu-thread','cu-kit','cu-heel','cu-cuff','cu-shoe'].filter(id=>!foundClues.has(id));
+  if(missing.length){
+    if(!silent){
+      const clue=clueHots.find(h=>h.dataset.cu===missing[0]);
+      toast(`还需查验：${clue.closest('.page').dataset.name} · ${clue.getAttribute('aria-label')}`);
+    }
+    return;
+  }
+  pick=who; sheet5.classList.add('accused');
+  $$('.suspect').forEach(s=>s.classList.toggle('chosen',s.dataset.who===who));
+  redo.classList.add('show');
+  const hint=$('#hint'), correct=who==='doctor';
+  hint.textContent=correct?`推理成立 · 你查看了 ${foundClues.size} 条线索`:`指认未成立 · 你查看了 ${foundClues.size} 条线索`;
+  hint.classList.remove('gone','good','bad');
+  hint.classList.add(correct?'good':'bad');
+  if(!silent) Audio.play(who==='doctor'?'thud':'paper');
+}
+function resetAccuse(){ pick=null; sheet5.classList.remove('accused'); $$('.suspect').forEach(s=>s.classList.remove('chosen')); redo.classList.remove('show'); const hint=$('#hint'); hint.textContent='重新检查线索后再次指认'; hint.classList.remove('gone','good','bad'); }
+$$('.suspect').forEach(s=>{
+  const go=()=>{ if(sheet5.classList.contains('accused')) return; accuse(s.dataset.who); };
+  s.addEventListener('click',go);
+  s.addEventListener('keydown',e=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); go(); } });
+});
+redo.addEventListener('click',resetAccuse);
+
+/* ---------- shared snow layer ---------- */
+const snowC=$('#snow'), sctx=snowC.getContext('2d');
+let flakes=[], snowW=0, snowH=0;
+function snowSize(){ const dpr=pixelRatio(); snowW=snowC.width=innerWidth*dpr; snowH=snowC.height=innerHeight*dpr; const n=Math.round(snowW*snowH/14000/(dpr*dpr)); flakes=Array.from({length:Math.min(260,n)},()=>({x:Math.random()*snowW,y:Math.random()*snowH,r:(Math.random()*1.6+.6)*dpr,v:(Math.random()*.6+.35)*dpr,w:Math.random()*6.28,a:Math.random()*.5+.3,dpr})); }
+addEventListener('resize',snowSize); snowSize();
+function snowTick(){
+  if(!settings.snow||reduced){ sctx.clearRect(0,0,snowW,snowH); if(settings.snow&&reduced){ sctx.fillStyle='#fbf8f1'; flakes.forEach(f=>{ sctx.globalAlpha=f.a*.6; sctx.beginPath(); sctx.arc(f.x,f.y,f.r,0,6.28); sctx.fill(); }); } return requestAnimationFrame(snowTick); }
+  sctx.clearRect(0,0,snowW,snowH); sctx.fillStyle='#fbf8f1';
+  for(const f of flakes){ f.y+=f.v; f.w+=.012; f.x+=Math.sin(f.w)*.4*f.dpr; if(f.y>snowH+4){ f.y=-4; f.x=Math.random()*snowW; } sctx.globalAlpha=f.a; sctx.beginPath(); sctx.arc(f.x,f.y,f.r,0,6.28); sctx.fill(); }
+  sctx.globalAlpha=1; requestAnimationFrame(snowTick);
+}
+snowTick();
+
+/* ---------- transitions: 3-5 s, built from the two adjacent pages ---------- */
+const fx=$('#fx'), fctx=fx.getContext('2d');
+let fxRaf=0;
+const grainTile=(()=>{ const c=document.createElement('canvas'); c.width=c.height=256; const g=c.getContext('2d'), im=g.createImageData(256,256); for(let i=0;i<im.data.length;i+=4){ const v=Math.random()*255; im.data[i]=im.data[i+1]=im.data[i+2]=v; im.data[i+3]=255; } g.putImageData(im,0,0); return c; })();
+function seeded(n){ let s=n*9301+49297; return ()=>{ s=(s*9301+49297)%233280; return s/233280; }; }
+const ease=t=>t<.5?2*t*t:1-Math.pow(-2*t+2,2)/2;
+const TR={
+  '0-1':{dur:3200,sound:'wind',draw(c,p,W,H){
+    const r=seeded(1);
+    if(p<.4){ const a=ease(Math.min(1,p/.3)); const g=c.createRadialGradient(W*.3,H*.55,10,W*.3,H*.55,Math.max(W,H)*(.2+a)); g.addColorStop(0,`rgba(243,227,176,${.95})`); g.addColorStop(1,`rgba(243,227,176,${a*.95})`); c.fillStyle=g; c.fillRect(0,0,W,H); }
+    else { const k=(p-.4)/.6; c.fillStyle=`rgba(243,227,176,${Math.max(0,.95-k*1.3)})`; c.fillRect(0,0,W,H); }
+    if(p>.25){ const k=(p-.25)/.75; for(let i=0;i<220;i++){ const x0=r()*W, y0=r()*H, sp=.4+r()*.8; const isSpark=k>.5 && i%3===0; const y=isSpark? (y0 - (k-.5)*H*sp*1.6) : (y0 + k*H*sp*.9)%H; const x=x0+Math.sin(k*6+i)*12; const rad=(1+r()*2.5)*(isSpark?.8:1); c.globalAlpha=Math.min(1,k*3)*(1-Math.max(0,(p-.85)/.15)); c.fillStyle=isSpark?'#d9a24a':(k>.55?'#e9b27a':'#fbf8f1'); c.beginPath(); c.arc(x,y,rad,0,6.28); c.fill(); } c.globalAlpha=1; }
+    if(p>.5){ c.fillStyle=`rgba(11,10,9,${Math.min(.55,(p-.5)*1.4)*(1-Math.max(0,(p-.8)/.2))})`; c.fillRect(0,0,W,H); }
+  }},
+  '1-2':{dur:3000,sound:'tick',thudAt:.72,draw(c,p,W,H){
+    c.fillStyle=`rgba(11,10,9,${p<.75?Math.min(.88,p*4):Math.max(0,.88-(p-.75)*3.6)})`; c.fillRect(0,0,W,H);
+    const px=W*.5, py=-H*.15, L=H*.78; const phase=p*p*34; const amp=.28*(1-Math.max(0,(p-.55)/.15)); const ang=Math.sin(phase)*amp;
+    let drop=0; if(p>.6) drop=Math.pow((p-.6)/.4,2)*H*2.2;
+    const bx=px+Math.sin(ang)*L, by=py+Math.cos(ang)*L+drop;
+    if(p<.9){ c.strokeStyle='#e9e2d0'; c.lineWidth=Math.max(3,W*.006); c.beginPath(); c.moveTo(px,py); c.lineTo(bx,by); c.stroke(); c.fillStyle='#e9e2d0'; c.beginPath(); c.arc(bx,by,Math.max(16,W*.04),0,6.28); c.fill(); c.fillStyle='#141210'; c.beginPath(); c.arc(bx,by,Math.max(5,W*.012),0,6.28); c.fill(); }
+    if(p>.72&&p<.95){ const k=(p-.72)/.23; c.strokeStyle=`rgba(233,226,208,${1-k})`; c.lineWidth=3; for(let i=0;i<9;i++){ const a=Math.PI+i*.39-.3; c.beginPath(); c.moveTo(W*.5+Math.cos(a)*W*.1*k*2, H+Math.sin(a)*W*.1*k*2); c.lineTo(W*.5+Math.cos(a)*W*.3*k*2, H+Math.sin(a)*W*.3*k*2); c.stroke(); } }
+  }},
+  '2-3':{dur:3400,sound:'crack',cracks:null,draw(c,p,W,H){
+    if(!this.cracks){ const r=seeded(3); this.cracks=Array.from({length:16},(_,i)=>{ let x=W*.5,y=H*.42,a=(i/16)*6.28+r()*.3; const pts=[[x,y]]; for(let k=0;k<22;k++){ a+=(r()-.5)*.9; const len=(14+r()*26)*Math.max(W,H)/900; x+=Math.cos(a)*len; y+=Math.sin(a)*len; pts.push([x,y]); } return pts; }); }
+    const bg=p<.7?Math.min(.72,p*2.4):Math.max(0,.72-(p-.7)*2.4); c.fillStyle=`rgba(10,9,8,${bg})`; c.fillRect(0,0,W,H);
+    const grow=Math.min(1,p/.72), fade=p>.8?1-(p-.8)/.2:1;
+    c.lineCap='round'; c.lineJoin='round';
+    for(const pts of this.cracks){ const n=Math.max(1,Math.floor(pts.length*grow)); c.strokeStyle=`rgba(20,18,16,${fade})`; c.lineWidth=7; c.beginPath(); pts.slice(0,n).forEach(([x,y],i)=>i?c.lineTo(x,y):c.moveTo(x,y)); c.stroke(); c.strokeStyle=`rgba(233,226,208,${fade})`; c.lineWidth=2.4; c.stroke(); }
+    if(p>.5){ const k=(p-.5)/.5; c.fillStyle=`rgba(20,18,16,${.9*fade})`; for(let i=0;i<6;i++){ const t=i/6; if(k>t){ const x=W*(.25+t*.5), y=H*(.3+t*.4); c.beginPath(); c.ellipse(x,y,W*.012,W*.022,2.3,0,6.28); c.fill(); } } }
+  }},
+  '3-4':{dur:3600,sound:'click',draw(c,p,W,H){
+    const dark=p<.7?Math.min(1,p*2.6):1-(p-.7)/.3*0; c.fillStyle=`rgba(5,5,4,${Math.min(1,p<.2?p*5:1)*(p>.86?1-(p-.86)/.14:1)})`; c.fillRect(0,0,W,H);
+    if(p>.1&&p<.7){ const k=(p-.1)/.6; const a=-1.2+k*1.9; const ox=W*.05, oy=H*.92; const len=Math.max(W,H)*1.6; const g=c.createLinearGradient(ox,oy,ox+Math.cos(a)*len,oy+Math.sin(a)*len); g.addColorStop(0,'rgba(243,227,176,.95)'); g.addColorStop(1,'rgba(243,227,176,0)'); c.fillStyle=g; c.beginPath(); c.moveTo(ox,oy); c.lineTo(ox+Math.cos(a-.09)*len,oy+Math.sin(a-.09)*len); c.lineTo(ox+Math.cos(a+.09)*len,oy+Math.sin(a+.09)*len); c.closePath(); c.fill(); }
+    if(p>.7&&p<.86){ const r=seeded(5); c.fillStyle='rgba(251,248,241,.7)'; for(let i=0;i<60;i++){ c.beginPath(); c.arc(r()*W,(r()*H+p*H*.3)%H,1+r()*2,0,6.28); c.fill(); } }
+  }}
+};
+function drawGrain(c,a,W,H){ c.globalAlpha=a*.35; c.globalCompositeOperation='multiply'; const pat=c.createPattern(grainTile,'repeat'); c.fillStyle=pat; c.fillRect(0,0,W,H); c.globalCompositeOperation='source-over'; c.globalAlpha=1; }
+const chaseCuts=[
+  ['click','#f3e3b0',.52,.52], // latch glint
+  ['wind','#a63835',.62,.4],   // blood trail
+  ['thud','#f3e3b0',.35,.72], // running lantern
+  ['wind','#e9e2d0',.73,.48], // snow at the gate
+  ['click','#f3e3b0',.49,.49] // last candle
+];
+chaseCuts.forEach(([sound,color,from,to],i)=>{
+  TR[(i+4)+'-'+(i+5)]={dur:980,sound,draw(c,p,W,H){
+    const alpha=Math.sin(p*Math.PI);
+    const sheet=pages[active].querySelector('.sheet').getBoundingClientRect();
+    const x=sheet.left+sheet.width*(from+(to-from)*p), y=H*(.69-.28*p);
+    c.fillStyle=`rgba(11,10,9,${alpha*.48})`;
+    c.fillRect(sheet.left,0,sheet.width,H);
+    c.globalAlpha=alpha;
+    c.strokeStyle=color;
+    c.lineWidth=i===1?8:3;
+    c.lineCap='round';
+    c.beginPath();
+    c.moveTo(sheet.left+sheet.width*from,H*.73);
+    c.quadraticCurveTo(x+sheet.width*.14,y+H*.09,x,y);
+    c.stroke();
+    c.fillStyle=color;
+    c.beginPath();
+    c.arc(x,y,5+alpha*10,0,Math.PI*2);
+    c.fill();
+    c.globalAlpha=1;
+  }};
+});
+function runTransition(a,b){
+  if(!settings.fx||reduced) return;
+  const key=Math.min(a,b)+'-'+Math.max(a,b), T=TR[key]; if(!T) return;
+  cancelAnimationFrame(fxRaf); T.cracks=null; let thudDone=false;
+  const dpr=pixelRatio(); fx.width=innerWidth*dpr; fx.height=innerHeight*dpr; fctx.setTransform(dpr,0,0,dpr,0,0);
+  const W=innerWidth, H=innerHeight, start=performance.now(); fx.classList.add('on');
+  Audio.play(T.sound);
+  const loop=now=>{ const p=Math.min(1,(now-start)/T.dur); fctx.clearRect(0,0,W,H); T.draw(fctx,p,W,H);
+    if(T.thudAt&&p>=T.thudAt&&!thudDone){ thudDone=true; Audio.play('thud'); stage.classList.add('shake'); setTimeout(()=>stage.classList.remove('shake'),340); }
+    if(p>.86) drawGrain(fctx,(p-.86)/.14,W,H);
+    if(p<1) fxRaf=requestAnimationFrame(loop); else { fctx.clearRect(0,0,W,H); fx.classList.remove('on'); } };
+  fxRaf=requestAnimationFrame(loop);
+}
+
+/* ---------- maker drawer ---------- */
+const maker=$('#maker');
+function toggleMaker(open){ const o=open??!maker.classList.contains('open'); maker.classList.toggle('open',o); $('#makerBtn').setAttribute('aria-pressed',o); }
+$('#makerBtn').addEventListener('click',()=>toggleMaker());
+$('#makerClose').addEventListener('click',()=>toggleMaker(false));
+function pressToggle(id,fn,label){ const b=$(id); b.addEventListener('click',()=>{ const on=b.getAttribute('aria-pressed')!=='true'; b.setAttribute('aria-pressed',on); if(label) b.textContent=label(on); fn(on); }); }
+pressToggle('#tgHot',on=>document.body.classList.toggle('show-hot',on));
+pressToggle('#tgFx',on=>settings.fx=on,on=>`过场动画 ${on?'开':'关'}`);
+pressToggle('#tgBoard',on=>document.body.classList.toggle('show-board',on));
+pressToggle('#tgSnow',on=>{settings.snow=on;},on=>`共享雪纹层 ${on?'开':'关'}`);
+
+/* image slots, kept in IndexedDB in this browser only */
+const DB={
+  open(){ return new Promise((res,rej)=>{ try{ const r=indexedDB.open('xueye-shanzhuang',1); r.onupgradeneeded=()=>r.result.createObjectStore('art'); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }catch(e){ rej(e); } }); },
+  async tx(mode,fn){ const d=await this.open(); return new Promise((res,rej)=>{ const t=d.transaction('art',mode), s=t.objectStore('art'); const out=fn(s); t.oncomplete=()=>res(out&&out.result); t.onerror=()=>rej(t.error); }); },
+  put(k,v){ return this.tx('readwrite',s=>s.put(v,k)); },
+  del(k){ return this.tx('readwrite',s=>s.delete(k)); },
+  async all(){ const d=await this.open(); return new Promise((res,rej)=>{ const s=d.transaction('art').objectStore('art'); const keys=s.getAllKeys(), vals=s.getAll(); vals.onsuccess=()=>{ keys.onsuccess=()=>res(keys.result.map((k,i)=>[k,vals.result[i]])); }; vals.onerror=()=>rej(vals.error); }); }
+};
+const pageNames=pages.map(page=>page.dataset.name);
+const artKeys=pages.map(page=>Number(page.querySelector('.sheet').dataset.page)-1);
+const slots=$('#slots');
+slots.innerHTML=pageNames.map((n,i)=>`<div class="slot" data-i="${i}">
+  <div class="thumb empty" id="thumb-${i}">空</div>
+  <div><div class="name">P${i+1} · ${n}</div><div class="meta" id="meta-${i}">分镜稿 · 待换图</div></div>
+  <div class="acts"><label class="btn" for="file-${i}">选图</label><input type="file" id="file-${i}" accept="image/*"><button class="btn" data-clear="${i}">清除</button></div>
+</div>`).join('');
+const urls={};
+function applyArt(i,blob){
+  const sheet=pages[i].querySelector('.sheet'), img=sheet.querySelector('.art'), th=document.getElementById('thumb-'+i);
+  if(urls[i]) URL.revokeObjectURL(urls[i]);
+  if(!blob){ delete urls[i]; img.removeAttribute('src'); img.alt=''; sheet.classList.remove('has-art'); th.replaceWith(Object.assign(document.createElement('div'),{className:'thumb empty',id:'thumb-'+i,textContent:'空'})); document.getElementById('meta-'+i).textContent='分镜稿 · 待换图'; return; }
+  const u=URL.createObjectURL(blob); urls[i]=u; img.src=u; img.alt=`P${i+1} · ${pageNames[i]}`; sheet.classList.add('has-art');
+  const t=document.createElement('img'); t.className='thumb'; t.id='thumb-'+i; t.alt=`P${i+1} · ${pageNames[i]}`; t.src=u; th.replaceWith(t);
+  const im=new Image(); im.onload=()=>{ const size=`${im.naturalWidth}×${im.naturalHeight} · ${(blob.size/1024/1024).toFixed(1)} MB`; document.getElementById('meta-'+i).textContent=Math.abs(im.naturalWidth/im.naturalHeight-1080/2060)>.02?`${size} · 比例不符`:size; }; im.src=u;
+}
+async function setArt(i,file){
+  if(!file||!file.type.startsWith('image/')){ toast('请放入图片文件'); return; }
+  applyArt(i,file);
+  try{ await DB.put(artKeys[i],file); toast(`P${i+1} 已换图`); }catch(e){ toast(`P${i+1} 已换图（本次会话有效）`); }
+}
+slots.addEventListener('change',e=>{ const inp=e.target.closest('input[type=file]'); if(!inp) return; const i=+inp.id.split('-')[1]; setArt(i,inp.files[0]); inp.value=''; });
+slots.addEventListener('click',async e=>{ const b=e.target.closest('[data-clear]'); if(!b) return; const i=+b.dataset.clear; applyArt(i,null); try{ await DB.del(artKeys[i]); }catch(_){} toast(`P${i+1} 已恢复分镜稿`); });
+pages.forEach((pg,i)=>{ const sh=pg.querySelector('.sheet');
+  sh.addEventListener('dragover',e=>{ e.preventDefault(); sh.classList.add('drop-on'); });
+  sh.addEventListener('dragleave',()=>sh.classList.remove('drop-on'));
+  sh.addEventListener('drop',e=>{ e.preventDefault(); sh.classList.remove('drop-on'); const f=e.dataTransfer.files&&e.dataTransfer.files[0]; if(f) setArt(i,f); });
+});
+DB.all().then(list=>list.forEach(([key,blob])=>{
+  const index=artKeys.indexOf(Number(key));
+  if(index>=0&&blob instanceof Blob) applyArt(index,blob);
+})).catch(()=>{});
+
+/* prompts */
+const STYLE='black and white woodcut print, visible carving knife marks, high contrast, coarse halftone dots, aged paper grain, cold hard quiet mood like an old printed book, comic panel layout, 1930s English manor, blizzard, single dark blood red accent only on key evidence, 70px continuous bleed at both top and bottom edges, no text, no speech bubbles, no sound effect lettering, no frame, no page number';
+const SUFFIX='--ar 9:16 --style raw --s 250';
+const PROMPTS=[
+ {t:'P1 抵达',en:`vertical comic page, low angle snowy mountain road at night, carriage with two pale lamp glows, manor only as a black silhouette on the ridge, foreground close-up of a line of footprints climbing the slope, the last print half buried by fresh snow, composition bottom third footprint close-up and upper two thirds empty snow sky, footprint chain runs off the bottom edge, ${STYLE} ${SUFFIX}`,cn:'雪夜山路仰视，马车灯两团光，山庄只露剪影；前景雪坡一行脚印向上延伸，最后一枚被落雪盖掉一半。下 1/3 脚印特写，上方大留白雪空。页底引导线：脚印链。'},
+ {t:'P2 大厅',en:`vertical comic page, great hall of a manor, six guests around a long table by the fire, the host's chair empty with a snow-dusted cloak over its back, wall clock stopped at 11:47, firelight cutting faces into hard-edged shadows, wet footprints on the carpet entering from the top edge, a swinging pendulum running off the bottom edge, an unopened sealed letter on the table, ${STYLE} ${SUFFIX}`,cn:'六人围炉，长桌，主人座位空着，椅背搭着雪未化的斗篷；挂钟停在 11:47。页顶接 P1 脚印化为地毯湿脚印，页底引导线：钟摆。交互：未拆的信。'},
+ {t:'P3 第一具尸体',en:`vertical comic page, guest room, a body collapsed beneath a window thick with frost flowers, the frost is the hero of the page, door bolted from the inside, key lying on the floor, half of a torn playing card in the dead hand, a pendulum bob striking down at the top edge, frost cracks spreading across the floor and off the bottom edge, ${STYLE} ${SUFFIX}`,cn:'客房，死者倒在窗下，窗玻璃结满冰花；门从内侧反锁，钥匙在地上。冰花是视觉主角。页顶接钟摆砸到底。交互：门锁、半张牌。'},
+ {t:'P4 搜查',en:`vertical comic page, long corridor in one-point perspective, a flashlight beam slicing across a row of doors, below it an overhead view of snow where a line of footprints stops halfway and vanishes, a bookshelf with one book pulled out revealing a hidden compartment, the light beam and a snow ridge run off the bottom edge, ${STYLE} ${SUFFIX}`,cn:'走廊纵深透视，手电光柱切过一排门；下一格雪地俯视，脚印走到一半凭空消失。页底引导线：光柱与雪脊。交互：雪地脚印、书架暗格。'},
+ {t:'P5 暗室',en:`three stacked woodcut panels: open medical ledger, a door bolt with a red waxed thread, a doctor's bag with a torn playing-card corner trapped in its clasp, ${STYLE} ${SUFFIX}`,cn:'三格从上到下：诊疗簿、蜡线门闩、医生药箱。三件证物放在各格中部，预留左侧对白区。'},
+ {t:'P6 渗痕',en:`single tall panel, ${STYLE} ${SUFFIX}`,cn:'搭扣突然颤了一下。柜底的血，正顺着地板缝往外走。 热区：夹在柜底的布条、地板缝里的血迹。'},
+ {t:'P7 北廊',en:`single tall panel, ${STYLE} ${SUFFIX}`,cn:'门被推开一道缝。提灯的人刚转过拐角，右脚便在雪水里打了个滑。 热区：缺角的右鞋印、被推开的风门。'},
+ {t:'P8 雪门',en:`single tall panel, ${STYLE} ${SUFFIX}`,cn:'风从铁栅里穿过去。那个人拽了两下栅门，转身躲进侧面的楼梯间。 热区：栅门上的锁、挂在侧门上的碎布。'},
+ {t:'P9 归席',en:`single tall panel, ${STYLE} ${SUFFIX}`,cn:'楼梯绕回旧餐厅。三人已围到桌前，唯有一把椅子是湿的。 热区：桌沿下的袖口、椅子下的右靴。'},
+ {t:'P10 对峙',en:`vertical comic page, lights out, almost entirely black page, only snow pouring in through a broken window as white specks and one hand holding up an oil lamp, three suspects as silhouettes in a row, final panel an empty chair with snow settled on its seat, ${STYLE} ${SUFFIX}`,cn:'灯灭。全黑页面上只有雪从破窗灌入的白点和一只举灯的手；最后一格是空椅子和椅面上的雪。交互：三选一指认。'}
+];
+$('#prompts').innerHTML=PROMPTS.map((p,i)=>`<div class="prompt"><div class="pt"><span>${p.t}</span><button class="copy" data-copy="p${i}">复制</button></div><pre id="p${i}">${p.en}</pre><div class="cn">${p.cn}</div></div>`).join('');
+const TRANS=[
+ {t:'P1→P2 光与颗粒',cn:'车灯眩光逐渐占满画面，白点化为雪粒，雪粒转为炉火火星，火星退去，露出大厅。运镜：缓慢推进，不摇不晃。最后 12 帧叠一层纸纹噪点。'},
+ {t:'P2→P3 钟摆',cn:'挂钟钟摆摆动加速，下坠出画，一声闷响后画面轻微一震，切进客房。运镜：缓慢推进，不摇不晃。最后 12 帧叠一层纸纹噪点。'},
+ {t:'P3→P4 裂纹',cn:'窗上冰花的裂纹生长、蔓延，裂纹的走向与雪地脚印重叠。运镜：缓慢推进，不摇不晃。最后 12 帧叠一层纸纹噪点。'},
+ {t:'P4→P5 照进暗室',cn:'手电扫过第三扇门，光斑落在柜上。'},
+ {t:'P5→P6 搭扣',cn:'药箱搭扣反光，镜头下移到柜底。'},
+ {t:'P6→P7 血线',cn:'顺着地板缝的红线进入北廊。'},
+ {t:'P7→P8 追灯',cn:'人影提灯掠过拐角，铁栅在灯光里显形。'},
+ {t:'P8→P9 回旋',cn:'栅外飞雪掠过，亮点向楼梯与旧餐厅移动。'},
+ {t:'P9→P10 熄灯',cn:'旧餐厅烛光收窄，在对峙页熄灭。'}
+];
+$('#transPrompts').innerHTML=TRANS.map((p,i)=>`<div class="prompt"><div class="pt"><span>${p.t}</span><button class="copy" data-copy="t${i}">复制</button></div><pre id="t${i}">${p.cn}</pre></div>`).join('');
+const hotJson=pages.map((pg,i)=>({page:i+1,name:pg.dataset.name,hotspots:[...pg.querySelectorAll('.hot, .suspect')].map(h=>{ const st=h.style; return {label:h.getAttribute('aria-label'),main:h.classList.contains('main')||h.classList.contains('suspect'),left:st.left||'row',top:st.top||'row',width:st.width||'1/3',height:st.height||'row',opens:h.dataset.cu||h.dataset.action||h.dataset.who||''}; })}));
+$('#hotJson').textContent=JSON.stringify(hotJson,null,1);
+const copyMap={neg:'#negPrompt',params:'#paramsText',hot:'#hotJson'};
+maker.addEventListener('click',async e=>{ const b=e.target.closest('.copy'); if(!b) return; const k=b.dataset.copy; const el=$(copyMap[k]||('#'+k)); if(!el) return; const txt=el.textContent;
+  try{ await navigator.clipboard.writeText(txt); b.textContent='已复制'; b.classList.add('ok'); }
+  catch(_){ const r=document.createRange(); r.selectNodeContents(el); const s=getSelection(); s.removeAllRanges(); s.addRange(r); b.textContent='已选中，请 Ctrl+C'; }
+  setTimeout(()=>{ b.textContent='复制'; b.classList.remove('ok'); },1600); });
+
+/* ---------- keyboard paging ---------- */
+addEventListener('keydown',e=>{ if($('#closeup').open||maker.classList.contains('open')) return; if(e.key==='ArrowDown'||e.key==='PageDown'){ e.preventDefault(); pages[Math.min(pages.length-1,active+1)].scrollIntoView({behavior:reduced?'auto':'smooth'}); } if(e.key==='ArrowUp'||e.key==='PageUp'){ e.preventDefault(); pages[Math.max(0,active-1)].scrollIntoView({behavior:reduced?'auto':'smooth'}); } });
+
+/* ---------- hot update boot ---------- */
+function start(data){ if(data&&data.pick) accuse(data.pick,true); if(data&&data.page) requestAnimationFrame(()=>pages[data.page].scrollIntoView()); }
+try{ window.claude?.hot?.snapshot?.(()=>({page:active,pick})); }catch(_){}
+if(window.claude?.hot?.ready) window.claude.hot.ready(start); else start(window.claude?.hot?.data??{});
+})();
+</script>
+</body>
+</html>

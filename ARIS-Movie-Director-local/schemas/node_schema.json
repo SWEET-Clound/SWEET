@@ -1,0 +1,410 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wanshuiyin/ARIS-Movie-Director/schemas/node_schema.json",
+  "schema_version": "node/comic/3.0",
+  "title": "ARIS-Movie-Director wiki node schema (comic, slim)",
+  "description": "Every node under wiki/nodes/<node_id>.json. SLIM comic schema (v3.0): 14 node_types across the authoring (Phase 1) + audited-spiral (Phase 2/3) layers. Replaces the v2.x 28-type video dump (15 video branches with empty payloads were cut). The 4 RUNTIME types (panel_attempt/review/decision/failure_mode) keep their exact original payload.required so the existing 198-node trace still validates; the 10 author types are new (no nodes yet). cli/validate_wiki.py is the executable enforcer and MIRRORS this contract — keep them in sync. Edge vocabulary in wiki/edges.jsonl.",
+  "type": "object",
+  "required": [
+    "node_id",
+    "node_type",
+    "title",
+    "status",
+    "created_at",
+    "payload"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "node_id": {
+      "type": "string",
+      "pattern": "^(intent|style|outline|asset|storyboard|panel|blueprint|prompt|motif|cont|attempt|review|decision|fail):[a-z0-9_-]+$",
+      "description": "prefix:slug. live prefixes: attempt/review/decision/fail; author prefixes: intent/style/outline/asset/storyboard/panel/blueprint/prompt/motif/cont."
+    },
+    "node_type": {
+      "enum": [
+        "intent_spec",
+        "style_anchor",
+        "outline_spec",
+        "asset",
+        "storyboard_spec",
+        "panel_spec",
+        "blueprint",
+        "prompt_bundle",
+        "motif_ledger",
+        "continuity_constraint",
+        "panel_attempt",
+        "review",
+        "decision",
+        "failure_mode"
+      ]
+    },
+    "title": {
+      "type": "string",
+      "maxLength": 160
+    },
+    "status": {
+      "enum": [
+        "draft",
+        "pending",
+        "under_review",
+        "locked",
+        "rejected",
+        "superseded",
+        "active",
+        "complete",
+        "final"
+      ],
+      "description": "runtime canon: panel_attempt->under_review, review->complete, decision->final, failure_mode->active. author canon: draft/pending->under_review->locked (or rejected/superseded)."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "payload": {
+      "type": "object"
+    }
+  },
+  "oneOf": [
+    {
+      "title": "intent_spec",
+      "properties": {
+        "node_type": {
+          "const": "intent_spec"
+        },
+        "payload": {
+          "type": "object",
+          "required": [
+            "raw_input_refs",
+            "user_goal",
+            "audience",
+            "format",
+            "constraints",
+            "subjects",
+            "source_skeleton",
+            "dual_identity",
+            "uncertainties",
+            "confidence"
+          ]
+        }
+      },
+      "required": [
+        "node_type",
+        "payload"
+      ]
+    },
+    {
+      "title": "style_anchor",
+      "properties": {
+        "node_type": {
+          "const": "style_anchor"
+        },
+        "payload": {
+          "type": "object",
+          "required": [
+            "dimension",
+            "value",
+            "source",
+            "locked"
+          ]
+        }
+      },
+      "required": [
+        "node_type",
+        "payload"
+      ]
+    },
+    {
+      "title": "outline_spec",
+      "properties": {
+        "node_type": {
+          "const": "outline_spec"
+        },
+        "payload": {
+          "type": "object",
+          "required": [
+            "source_intent_id",
+            "title",
+            "logline",
+            "tagline",
+            "design_constraint",
+            "target_page_count",
+            "narrative_beats",
+            "beat_table",
+            "motif_arcs",
+            "character_asset_ids",
+            "scene_asset_ids",
+            "prop_asset_ids",
+            "global_style_bible",
+            "budget"
+          ]
+        }
+      },
+      "required": [
+        "node_type",
+        "payload"
+      ]
+    },
+    {
+      "title": "asset",
+      "properties": {
+        "node_type": {
+          "const": "asset"
+        },
+        "payload": {
+          "type": "object",
+          "required": [
+            "asset_kind",
+            "name",
+            "visual_description",
+            "identity_lock",
+            "ref_requirements",
+            "review_status",
+            "version"
+          ]
+        }
+      },
+      "required": [
+        "node_type",
+        "payload"
+      ]
+    },
+    {
+      "title": "storyboard_spec",
+      "properties": {
+        "node_type": {
+          "const": "storyboard_spec"
+        },
+        "payload": {
+          "type": "object",
+          "required": [
+            "source_outline_id",
+            "page_order",
+            "page_ids",
+            "panel_ids",
+            "global_policies",
+            "motif_ledger_id",
+            "consolidated_asset_requests"
+          ]
+        }
+      },
+      "required": [
+        "node_type",
+        "payload"
+      ]
+    },
+    {
+      "title": "panel_spec",
+      "properties": {
+        "node_type": {
+          "const": "panel_spec"
+        },
+        "payload": {
+          "type": "object",
+          "required": [
+            "source_storyboard_id",
+            "page_id",
+            "panel_id",
+            "sequence_index",
+            "page_type",
+            "world",
+            "asset_ids",
+            "text_mode",
+            "expected_literals",
+            "content_blueprint",
+            "bubbles",
+            "side_narration",
+            "motifs"
+          ]
+        }
+      },
+      "required": [
+        "node_type",
+        "payload"
+      ]
+    },
+    {
+      "title": "blueprint",
+      "properties": {
+        "node_type": {
+          "const": "blueprint"
+        },
+        "payload": {
+          "type": "object",
+          "required": [
+            "source_panel_id",
+            "content_svg",
+            "expected_literals",
+            "safe_zones",
+            "html_bubbles",
+            "crop",
+            "negative_space_policy",
+            "generator_script",
+            "file_sha256"
+          ]
+        }
+      },
+      "required": [
+        "node_type",
+        "payload"
+      ]
+    },
+    {
+      "title": "prompt_bundle",
+      "properties": {
+        "node_type": {
+          "const": "prompt_bundle"
+        },
+        "payload": {
+          "type": "object",
+          "required": [
+            "source_panel_id",
+            "source_blueprint_id",
+            "style_prefix",
+            "composed_prompt",
+            "banned_vocab_scan",
+            "identity_ref_paths"
+          ]
+        }
+      },
+      "required": [
+        "node_type",
+        "payload"
+      ]
+    },
+    {
+      "title": "motif_ledger",
+      "properties": {
+        "node_type": {
+          "const": "motif_ledger"
+        },
+        "payload": {
+          "type": "object",
+          "required": [
+            "source_storyboard_id",
+            "columns",
+            "rows",
+            "invariants",
+            "mirror_locks"
+          ]
+        }
+      },
+      "required": [
+        "node_type",
+        "payload"
+      ]
+    },
+    {
+      "title": "continuity_constraint",
+      "properties": {
+        "node_type": {
+          "const": "continuity_constraint"
+        },
+        "payload": {
+          "type": "object",
+          "required": [
+            "family",
+            "constraint_text",
+            "applies_to_panel_ids",
+            "source_node_id",
+            "active"
+          ]
+        }
+      },
+      "required": [
+        "node_type",
+        "payload"
+      ]
+    },
+    {
+      "title": "panel_attempt",
+      "properties": {
+        "node_type": {
+          "const": "panel_attempt"
+        },
+        "payload": {
+          "type": "object",
+          "required": [
+            "source_panel_id",
+            "image_path",
+            "attempt_index"
+          ]
+        }
+      },
+      "required": [
+        "node_type",
+        "payload"
+      ]
+    },
+    {
+      "title": "review",
+      "properties": {
+        "node_type": {
+          "const": "review"
+        },
+        "payload": {
+          "type": "object",
+          "required": [
+            "target_node_id",
+            "reviewer",
+            "gate_kind"
+          ]
+        }
+      },
+      "required": [
+        "node_type",
+        "payload"
+      ]
+    },
+    {
+      "title": "decision",
+      "properties": {
+        "node_type": {
+          "const": "decision"
+        },
+        "payload": {
+          "type": "object",
+          "required": [
+            "target_node_id",
+            "verdict",
+            "gate_kind"
+          ]
+        }
+      },
+      "required": [
+        "node_type",
+        "payload"
+      ]
+    },
+    {
+      "title": "failure_mode",
+      "properties": {
+        "node_type": {
+          "const": "failure_mode"
+        },
+        "payload": {
+          "type": "object",
+          "required": [
+            "layer",
+            "affected_shot_ids",
+            "active"
+          ]
+        }
+      },
+      "required": [
+        "node_type",
+        "payload"
+      ]
+    }
+  ],
+  "$comment": "acceptance_stage (panel_attempt), point_of_divergence/strike_count_for_target/rewrite_from_*/frozen_prefix_clip_ids (decision, assembly), review_scores (review, upstream gates) are OPTIONAL payload fields written by the staged-acceptance engine upgrade + the cross-layer gates; not required so the pre-upgrade trace validates."
+}
