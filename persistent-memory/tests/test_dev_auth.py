@@ -1,18 +1,110 @@
+import base64
 import json
 from datetime import UTC, datetime, timedelta
 from email.message import Message
 from io import BytesIO
+from pathlib import Path
 from urllib.request import HTTPSHandler
 from urllib.response import addinfourl
+from uuid import uuid4
 
 import jwt
 import pytest
+from alembic import command
+from alembic.config import Config
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import HTTPException
+from pydantic import SecretStr
 
 from memory_system.api import JwtAuthenticator
-from memory_system.dev import issue_dev_token
+from memory_system.dev import issue_dev_token, migrate_main
+from memory_system.event_cipher import EventCipher
 from memory_system.settings import Settings
+
+
+def test_production_migration_rejects_unverified_database_url(monkeypatch) -> None:
+    monkeypatch.setenv("MEMORY_ENVIRONMENT", "production")
+    monkeypatch.setenv("MEMORY_DATABASE_URL", "postgresql+psycopg://unused/memory?sslmode=require")
+    with pytest.raises(ValueError, match="migration database URL must specify sslmode=verify-full"):
+        migrate_main()
+
+
+def test_production_migration_accepts_url_encoded_tls_options(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("MEMORY_ENVIRONMENT", "production")
+    monkeypatch.setenv(
+        "MEMORY_DATABASE_URL",
+        "postgresql+psycopg://owner:p%25ss@unused/memory"
+        "?sslmode=verify-full&sslrootcert=%2Fcerts%2Froot%20ca.pem",
+    )
+    config = Config()
+    migrations = Path(__file__).resolve().parents[1] / "migrations"
+    config.set_main_option("script_location", str(migrations))
+
+    command.upgrade(config, "head", sql=True)
+
+    assert "CREATE TABLE memory_event" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("sslmode", ["require", "verify-full&sslmode=disable", "verify-full"])
+def test_production_database_requires_full_tls_verification(sslmode: str) -> None:
+    options = {
+        "_env_file": None,
+        "environment": "production",
+        "database_url": f"postgresql+psycopg://db.test/memory?sslmode={sslmode}",
+        "jwt_issuer": "issuer",
+        "jwt_audience": "memory-api",
+        "jwks_url": "https://issuer.test/jwks",
+        "event_encryption_key": base64.b64encode(bytes(32)).decode(),
+    }
+    if sslmode == "verify-full":
+        assert Settings(**options).build_event_cipher() is not None
+    else:
+        with pytest.raises(ValueError, match="MEMORY_DATABASE_URL must specify sslmode=verify-full"):
+            Settings(**options)
+
+
+@pytest.mark.parametrize("key", [None, "", "not-base64"])
+def test_production_rejects_missing_or_invalid_event_encryption_key(key: str | None) -> None:
+    with pytest.raises(ValueError, match="MEMORY_EVENT_ENCRYPTION_KEY|event encryption key"):
+        Settings(
+            _env_file=None,
+            environment="production",
+            database_url="postgresql+psycopg://db.test/memory?sslmode=verify-full",
+            jwt_issuer="issuer",
+            jwt_audience="memory-api",
+            jwks_url="https://issuer.test/jwks",
+            event_encryption_key=key,
+        ).build_event_cipher()
+
+
+def test_production_loads_mounted_event_keys(tmp_path: Path, monkeypatch) -> None:
+    primary = base64.b64encode(bytes(32)).decode()
+    fallback = base64.b64encode(bytes([1]) * 32).decode()
+    primary_path = tmp_path / "primary"
+    fallback_path = tmp_path / "fallback"
+    primary_path.write_text(primary + "\n", encoding="ascii")
+    fallback_path.write_text(fallback + "\n", encoding="ascii")
+    monkeypatch.setenv("MEMORY_EVENT_ENCRYPTION_KEY_FILE", str(primary_path))
+    monkeypatch.setenv("MEMORY_EVENT_ENCRYPTION_FALLBACK_KEY_FILE", str(fallback_path))
+    settings = Settings(
+        _env_file=None,
+        environment="production",
+        database_url="postgresql+psycopg://db.test/memory?sslmode=verify-full",
+        jwt_issuer="issuer",
+        jwt_audience="memory-api",
+        jwks_url="https://issuer.test/jwks",
+        event_encryption_rotate=True,
+    )
+    cipher = settings.build_event_cipher()
+    assert cipher is not None and cipher.key_id == EventCipher(primary).key_id
+    event_id = str(uuid4())
+    old_payload = EventCipher(fallback).encrypt(event_id, "旧正文", {})
+    assert cipher.decrypt(event_id, old_payload) == {"content": "旧正文", "metadata": {}}
+    with pytest.raises(ValueError, match="configure only one"):
+        settings.model_copy(update={"event_encryption_key": SecretStr(primary)}).build_event_cipher()
+    fallback_path.unlink()
+    with pytest.raises(ValueError, match="cannot read MEMORY_EVENT_ENCRYPTION_FALLBACK_KEY_FILE"):
+        settings.build_event_cipher()
 
 
 @pytest.mark.parametrize("url", ["http://issuer.test/jwks", "https:///jwks"])

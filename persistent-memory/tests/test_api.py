@@ -97,6 +97,26 @@ async def test_event_endpoint_distinguishes_created_from_idempotent_replay() -> 
 
 
 @pytest.mark.asyncio
+async def test_event_endpoint_rejects_naive_time() -> None:
+    app = create_app(StubSystem(), authenticate, lifespan)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/v1/memory/events",
+            headers={"Idempotency-Key": "naive-time"},
+            json={
+                "thread_id": "thread-a",
+                "source": "user",
+                "content": "hello",
+                "occurred_at": "2026-11-06T12:00:00",
+            },
+        )
+    assert response.status_code == 422
+    assert response.json()["detail"] == [
+        {"loc": ["body", "occurred_at"], "type": "timezone_aware"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_event_endpoint_rejects_oversized_metadata() -> None:
     app = create_app(StubSystem(), authenticate, lifespan)
     body = {
@@ -115,6 +135,8 @@ async def test_event_endpoint_rejects_oversized_metadata() -> None:
         )
 
     assert response.status_code == 422
+    assert "untrusted" not in response.text
+    assert "xxxxxxxxxx" not in response.text
 
 
 @pytest.mark.asyncio
@@ -144,6 +166,24 @@ async def test_write_rate_limit_returns_retryable_429() -> None:
     assert response.headers["Retry-After"] == "17"
     assert response.json() == {"code": "write_rate_limited", "operation": "event"}
     assert 'memory_rate_limited_writes_total{operation="event"}' in metrics.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("candidate_status", ["quarantined", "rejected"])
+async def test_candidate_listing_requires_review_purpose(candidate_status: str) -> None:
+    class CandidateSystem(StubSystem):
+        async def list_memories(self, query):
+            assert query.statuses == ["active", candidate_status]
+            return []
+
+    for auth, expected in ((authenticate, 403), (authenticate_reviewer, 200)):
+        app = create_app(CandidateSystem(), auth, lifespan)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get(
+                "/v1/memory/items",
+                params=[("statuses", "active"), ("statuses", candidate_status)],
+            )
+        assert response.status_code == expected
 
 
 @pytest.mark.asyncio

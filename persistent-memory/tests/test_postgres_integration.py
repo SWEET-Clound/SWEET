@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import os
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -9,16 +10,20 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, Client, MockTransport, Response
+from psycopg.errors import UndefinedColumn
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from memory_system.api import JwtAuthenticator, create_app
 from memory_system.consolidation import Consolidator, HeuristicExtractor
+from memory_system.dev import check_worker_database
+from memory_system.embedding import EmbeddingClient
+from memory_system.event_cipher import EventCipher
+from memory_system.llm import ModelResponseTooLarge
 from memory_system.models import (
     CorrectCommand,
     CorrectProcedureCommand,
     DoNotRememberCommand,
-    EventJob,
     EventSource,
     ForgetCommand,
     InteractionEvent,
@@ -32,6 +37,8 @@ from memory_system.models import (
 )
 from memory_system.policy import MemoryPolicy
 from memory_system.postgres import (
+    DeletionCanaryFailed,
+    EventPayloadUnreadable,
     IdempotencyConflictError,
     NotFoundError,
     PostgresRepository,
@@ -39,7 +46,7 @@ from memory_system.postgres import (
 )
 from memory_system.retrieval import render_data_only
 from memory_system.system import MemorySystem
-from memory_system.worker import process_one_extraction
+from memory_system.worker import backfill_embeddings, process_one_extraction
 
 
 def _test_role_url(variable: str) -> str:
@@ -148,9 +155,9 @@ async def test_explicit_opt_out_blocks_evidence_but_allows_erasure(legacy: bool)
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
-@pytest.mark.parametrize("schema_visible", [True, False])
-async def test_api_database_readiness_checks_visible_schema(schema_visible: bool) -> None:
-    options = {} if schema_visible else {"options": "-c search_path=pg_catalog"}
+@pytest.mark.parametrize("schema_state", ["current", "hidden", "before_rotation_retry"])
+async def test_api_database_readiness_checks_visible_schema(schema_state: str) -> None:
+    options = {"options": "-c search_path=pg_catalog"} if schema_state == "hidden" else {}
     repository = PostgresRepository(
         create_async_engine(_test_app_database_url(), connect_args=options)
     )
@@ -165,14 +172,29 @@ async def test_api_database_readiness_checks_visible_schema(schema_visible: bool
         lifespan,
     )
     try:
+        if schema_state == "before_rotation_retry":
+            root = Path(__file__).resolve().parents[1]
+            config = Config(root / "alembic.ini")
+            config.set_main_option("script_location", str(root / "migrations"))
+            config.set_main_option("sqlalchemy.url", _test_database_url())
+            worker_url = _test_role_url("MEMORY_TEST_WORKER_DATABASE_URL")
+            command.downgrade(config, "20261106_0017")
         async with repository.engine.connect() as connection:
             assert (await connection.exec_driver_sql("SELECT 1")).scalar_one() == 1
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.get("/health/ready")
+            if schema_state == "before_rotation_retry":
+                with pytest.raises(UndefinedColumn, match="ciphertext_retry_at"):
+                    check_worker_database(worker_url)
+                command.upgrade(config, "head")
+                check_worker_database(worker_url)
+                assert (await client.get("/health/ready")).status_code == 200
     finally:
         await repository.close()
-    assert response.status_code == (200 if schema_visible else 503)
-    if not schema_visible:
+        if schema_state == "before_rotation_retry":
+            _upgrade_test_database(_test_database_url())
+    assert response.status_code == (200 if schema_state == "current" else 503)
+    if schema_state != "current":
         assert response.json() == {"code": "memory_unavailable"}
 
 
@@ -335,15 +357,19 @@ async def test_write_limits_are_atomic_idempotent_and_scope_isolated() -> None:
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
-@pytest.mark.parametrize("use_worker_role", [False, True])
-async def test_event_to_automatic_memory_to_physical_deletion(use_worker_role: bool) -> None:
+@pytest.mark.parametrize("use_worker_role, encrypted", [(False, False), (True, False), (True, True)])
+async def test_event_to_automatic_memory_to_physical_deletion(
+    use_worker_role: bool, encrypted: bool
+) -> None:
     if use_worker_role:
         worker_url = _test_role_url("MEMORY_TEST_WORKER_DATABASE_URL")
         app_url = _test_app_database_url()
     else:
         worker_url = app_url = _test_database_url()
-    repository = PostgresRepository.from_url(app_url)
-    worker = PostgresRepository.from_url(worker_url)
+    key = base64.b64encode(os.urandom(32)).decode() if encrypted else None
+    cipher = EventCipher(key) if key is not None else None
+    repository = PostgresRepository.from_url(app_url, event_cipher=cipher)
+    worker = PostgresRepository.from_url(worker_url, event_cipher=cipher)
     scope = MemoryScope(
         tenant_id=f"tenant-{uuid4()}", user_id="user-a", agent_id="agent-a"
     )
@@ -357,21 +383,281 @@ async def test_event_to_automatic_memory_to_physical_deletion(use_worker_role: b
         allow_memory_extraction=True,
     )
     try:
-        receipt = await repository.record_event(source)
+        if cipher is None:
+            receipt = await repository.record_event(source)
+        else:
+            legacy = PostgresRepository.from_url(app_url)
+            try:
+                source = source.model_copy(update={"metadata": {"legacy": "历史元数据"}})
+                receipt = await legacy.record_event(source)
+                async with worker.engine.begin() as connection:
+                    await connection.exec_driver_sql(
+                        "SELECT id FROM memory_event WHERE id=%s FOR UPDATE", (receipt.event_id,)
+                    )
+                    await asyncio.wait_for(worker.run_maintenance(30), timeout=3)
+                    row = (await connection.exec_driver_sql(
+                        "SELECT content, ciphertext FROM memory_event WHERE id=%s",
+                        (receipt.event_id,),
+                    )).one()
+                    assert tuple(row) == (source.content, None)
+                await worker.run_maintenance(30)
+                async with worker.engine.connect() as connection:
+                    row = (await connection.exec_driver_sql(
+                        "SELECT content, metadata, ciphertext FROM memory_event WHERE id=%s",
+                        (receipt.event_id,),
+                    )).one()
+                    assert row.content == "" and row.metadata == {}
+                    assert cipher.decrypt(receipt.event_id, row.ciphertext) == {
+                        "content": source.content, "metadata": source.metadata,
+                    }
+                    ciphertext = row.ciphertext
+                await worker.run_maintenance(30)
+                async with worker.engine.connect() as connection:
+                    assert (await connection.exec_driver_sql(
+                        "SELECT ciphertext FROM memory_event WHERE id=%s", (receipt.event_id,)
+                    )).scalar_one() == ciphertext
+            finally:
+                await legacy.close()
         worked = await process_one_extraction(
             worker, Consolidator(HeuristicExtractor(), MemoryPolicy())
         )
         processing = await repository.event_processing_status(scope, receipt.event_id)
         memories = await repository.list_memories(MemoryListQuery(scope=scope))
+        assert not await worker.store_embedding(
+            memories[0].memory_id, "stale statement", "test-model", [1.0, 0.0]
+        )
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            return Response(200, json={"data": [{"index": 0, "embedding": [1, 0]}]})
+
+        transport = MockTransport(respond)
+        with Client(base_url="http://embedding.test/v1/", transport=transport) as http:
+            client = EmbeddingClient(http, "test-model", 2)
+            async with worker.embedding_backfill_lock(client.model, client.dimensions) as acquired:
+                assert acquired
+                await backfill_embeddings(worker, client)
+                assert not requests
+            await backfill_embeddings(worker, client)
+        assert len(requests) == 1
+        assert await worker.pending_embeddings("test-model", 2) == []
+        query_time = datetime.now(UTC)
+        semantic = await repository.search(
+            scope, "unrelated words", "task", query_time,
+            embedding_model="test-model", query_embedding=[1.0, 0.0],
+        )
+        assert [item.memory_id for item in semantic] == [memories[0].memory_id]
+        assert semantic[0].query_matched
+        request = RecallRequest(
+            **scope.model_dump(), thread_id=source.thread_id, query="unrelated words",
+            purpose="task", token_budget=512, now=query_time,
+        )
+        with Client(base_url="http://embedding.test/v1/", transport=transport) as http:
+            system = MemorySystem(repository, MemoryPolicy(), 2048, EmbeddingClient(http, "test-model", 2))
+            context = await system.build_context(request)
+            assert [item.memory_id for item in context.items] == [memories[0].memory_id]
+        unavailable = MockTransport(lambda _: Response(503))
+        with Client(base_url="http://embedding.test/v1/", transport=unavailable) as http:
+            system = MemorySystem(repository, MemoryPolicy(), 2048, EmbeddingClient(http, "test-model", 2))
+            context = await system.build_context(
+                request.model_copy(update={"query": memories[0].statement})
+            )
+            assert [item.memory_id for item in context.items] == [memories[0].memory_id]
+        for model, vector in (("other-model", [1.0, 0.0]), ("test-model", [1.0])):
+            assert not await repository.search(
+                scope, "unrelated words", "task", query_time,
+                embedding_model=model, query_embedding=vector,
+            )
+        async with repository.engine.connect() as connection:
+            await repository._set_scope(connection, scope)
+            assert (await connection.exec_driver_sql(
+                "SELECT count(*) FROM memory_embedding"
+            )).scalar_one() == 1
+            await repository._set_scope(connection, scope.model_copy(update={"user_id": "other"}))
+            assert (await connection.exec_driver_sql(
+                "SELECT count(*) FROM memory_embedding"
+            )).scalar_one() == (0 if use_worker_role else 1)
+        if use_worker_role:
+            async with worker.engine.begin() as connection:
+                await connection.exec_driver_sql(
+                    "UPDATE memory_item SET poisoning_flags=ARRAY['test_flag'] WHERE id=%s",
+                    (memories[0].memory_id,),
+                )
+            async with repository.engine.connect() as connection:
+                await repository._set_scope(connection, scope)
+                assert (await connection.exec_driver_sql(
+                    "SELECT count(*) FROM memory_embedding WHERE memory_id=%s",
+                    (memories[0].memory_id,),
+                )).scalar_one() == 0
+            async with worker.engine.begin() as connection:
+                await connection.exec_driver_sql(
+                    "UPDATE memory_item SET poisoning_flags='{}'::text[] WHERE id=%s",
+                    (memories[0].memory_id,),
+                )
         affected, deletion_job_id = await repository.isolate_memories(
             scope, [memories[0].memory_id]
         )
+        assert not await worker.store_embedding(
+            memories[0].memory_id, memories[0].statement, "test-model", [0.0, 1.0]
+        )
+        assert not await repository.search(
+            scope, "unrelated words", "task", datetime.now(UTC),
+            embedding_model="test-model", query_embedding=[1.0, 0.0],
+        )
+        assert not await repository.list_memories(
+            MemoryListQuery(scope=scope, statuses=["active", "deleting"])
+        )
+        new_source = source.model_copy(update={"idempotency_key": "fresh-evidence"})
+        new_receipt = await repository.record_event(new_source)
+        consolidator = Consolidator(HeuristicExtractor(), MemoryPolicy())
+        assert await process_one_extraction(worker, consolidator)
+        deferred = await repository.event_processing_status(scope, new_receipt.event_id)
+        assert deferred.extraction_status == "retry"
+        assert deferred.error_code == "MemoryDeletionInProgress"
         deletion = await repository.deletion_status(scope, deletion_job_id or "")
-        while deletion.status == "pending":
-            assert await worker.process_one_deletion() is True
-            deletion = await repository.deletion_status(scope, deletion_job_id or "")
+        assert deletion.status == "pending"
+        if use_worker_role:
+            owner = PostgresRepository.from_url(_test_database_url())
+            try:
+                async with owner.engine.begin() as connection:
+                    await connection.exec_driver_sql(
+                        "CREATE FUNCTION test_retain_diagnostic() RETURNS trigger "
+                        "LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END; $$"
+                    )
+                    await connection.exec_driver_sql(
+                        "CREATE TRIGGER test_retain_diagnostic BEFORE DELETE ON "
+                        "memory_recall_diagnostic FOR EACH ROW EXECUTE FUNCTION "
+                        "test_retain_diagnostic()"
+                    )
+                try:
+                    with pytest.raises(DeletionCanaryFailed, match="deletion_canary_failed"):
+                        await worker.process_one_deletion()
+                    async with worker.engine.connect() as connection:
+                        job = (await connection.exec_driver_sql(
+                            "SELECT status, attempts, error_code FROM deletion_job WHERE id=%s",
+                            (deletion_job_id,),
+                        )).one()
+                        assert tuple(job) == ("retry", 1, "DeletionCanaryFailed")
+                        assert (await connection.exec_driver_sql(
+                            "SELECT count(*) FROM memory_embedding WHERE memory_id=%s",
+                            (memories[0].memory_id,),
+                        )).scalar_one() == 1
+                        event_row = (await connection.exec_driver_sql(
+                            "SELECT content, ciphertext FROM memory_event WHERE id=%s",
+                            (receipt.event_id,),
+                        )).one()
+                        if cipher is not None:
+                            assert event_row.content == ""
+                            assert cipher.decrypt(receipt.event_id, event_row.ciphertext) == {
+                                "content": source.content, "metadata": source.metadata,
+                            }
+                        else:
+                            assert tuple(event_row) == (source.content, None)
+                finally:
+                    async with owner.engine.begin() as connection:
+                        await connection.exec_driver_sql(
+                            "DROP TRIGGER test_retain_diagnostic ON memory_recall_diagnostic"
+                        )
+                        await connection.exec_driver_sql("DROP FUNCTION test_retain_diagnostic()")
+                async with worker.engine.begin() as connection:
+                    await connection.exec_driver_sql(
+                        "UPDATE deletion_job SET available_at=now() WHERE id=%s",
+                        (deletion_job_id,),
+                    )
+            finally:
+                await owner.close()
+        assert await worker.process_one_deletion() is True
+        deletion = await repository.deletion_status(scope, deletion_job_id or "")
         remaining = await repository.list_memories(MemoryListQuery(scope=scope))
+        async with worker.engine.connect() as connection:
+            assert (await connection.exec_driver_sql(
+                "SELECT count(*) FROM memory_embedding WHERE memory_id=%s",
+                (memories[0].memory_id,),
+            )).scalar_one() == 0
+            assert (await connection.exec_driver_sql(
+                "SELECT count(*) FROM memory_evidence WHERE memory_id=%s",
+                (memories[0].memory_id,),
+            )).scalar_one() == 0
+            assert (await connection.exec_driver_sql(
+                "SELECT count(*) FROM memory_recall_diagnostic WHERE id=%s",
+                (context.diagnostics_id,),
+            )).scalar_one() == 0
         replay_after_deletion = await repository.record_event(source)
+        async with worker.engine.begin() as connection:
+            await connection.exec_driver_sql(
+                "UPDATE memory_outbox SET available_at=now() WHERE event_id=%s AND status='retry'",
+                (new_receipt.event_id,),
+            )
+        assert await process_one_extraction(worker, consolidator)
+        recovered = await repository.event_processing_status(scope, new_receipt.event_id)
+        assert recovered.extraction_status == "completed"
+        assert recovered.attempts == 2
+        replacement, = await repository.list_memories(MemoryListQuery(scope=scope))
+        assert replacement.memory_id != memories[0].memory_id
+        assert replacement.source_event_ids == [new_receipt.event_id]
+        if key is not None:
+            await repository.execute_command_idempotent(
+                DoNotRememberCommand(
+                    action="do_not_remember", scope=scope, event_ids=[receipt.event_id]
+                ),
+                "erase-encrypted-event",
+                "erase-encrypted-event",
+                MemoryPolicy().version,
+            )
+            assert await worker.process_one_deletion()
+            async with worker.engine.connect() as connection:
+                assert tuple((await connection.exec_driver_sql(
+                    "SELECT content, ciphertext FROM memory_event WHERE id=%s",
+                    (receipt.event_id,),
+                )).one()) == ("[deleted-by-user]", None)
+            new_key = base64.b64encode(os.urandom(32)).decode()
+            damaged = await repository.record_event(
+                source.model_copy(update={"idempotency_key": "damaged-ciphertext"})
+            )
+            damaged_bytes = bytes(32)
+            async with worker.engine.begin() as connection:
+                await connection.exec_driver_sql(
+                    "UPDATE memory_event SET ciphertext=%s WHERE id=%s",
+                    (damaged_bytes, damaged.event_id),
+                )
+            rotated = PostgresRepository.from_url(
+                worker_url,
+                event_cipher=EventCipher(new_key, key),
+                rotate_event_ciphertext=True,
+            )
+            try:
+                await rotated.run_maintenance(30)
+                async with rotated.engine.connect() as connection:
+                    row = (await connection.exec_driver_sql(
+                        "SELECT ciphertext, ciphertext_key_id FROM memory_event WHERE id=%s",
+                        (new_receipt.event_id,),
+                    )).one()
+                    new_cipher = EventCipher(new_key)
+                    assert row.ciphertext_key_id == new_cipher.key_id
+                    assert new_cipher.decrypt(new_receipt.event_id, row.ciphertext) == {
+                        "content": new_source.content, "metadata": new_source.metadata,
+                    }
+                    failed = (await connection.exec_driver_sql(
+                        "SELECT ciphertext, ciphertext_retry_at > now() AS deferred "
+                        "FROM memory_event WHERE id=%s",
+                        (damaged.event_id,),
+                    )).one()
+                    assert tuple(failed) == (damaged_bytes, True)
+                following = await repository.record_event(
+                    source.model_copy(update={"idempotency_key": "after-damaged-ciphertext"})
+                )
+                with pytest.raises(EventPayloadUnreadable):
+                    await process_one_extraction(rotated, consolidator)
+                failed_job = await repository.event_processing_status(scope, damaged.event_id)
+                assert failed_job.extraction_status == "retry"
+                assert failed_job.attempts == 1
+                assert failed_job.error_code == "EventPayloadUnreadable"
+                assert await process_one_extraction(rotated, consolidator)
+                next_job = await repository.event_processing_status(scope, following.event_id)
+                assert next_job.extraction_status == "completed"
+            finally:
+                await rotated.close()
     finally:
         await worker.close()
         await repository.close()
@@ -384,6 +670,45 @@ async def test_event_to_automatic_memory_to_physical_deletion(use_worker_role: b
     assert deletion.status == "completed"
     assert remaining == []
     assert replay_after_deletion.duplicate is True
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_worker_does_not_retry_oversized_model_response() -> None:
+    class OversizedExtractor(HeuristicExtractor):
+        def extract(self, event):
+            raise ModelResponseTooLarge()
+
+    scope = MemoryScope(tenant_id="tenant-a", user_id="user-a", agent_id="agent-a")
+    source = InteractionEvent(
+        **scope.model_dump(), thread_id="thread-a", idempotency_key="oversized-model",
+        source=EventSource.USER, content="请记住：我喜欢简洁回答",
+        occurred_at=datetime.now(UTC), allow_memory_extraction=True,
+    )
+    repository = PostgresRepository.from_url(_test_database_url())
+    try:
+        receipt = await repository.record_event(source)
+        consolidator = Consolidator(OversizedExtractor(), MemoryPolicy())
+        assert await process_one_extraction(repository, consolidator)
+        status = await repository.event_processing_status(scope, receipt.event_id)
+        assert status.extraction_status == "failed"
+        assert status.attempts == 1
+        assert status.error_code == "ModelResponseTooLarge"
+        assert not await process_one_extraction(repository, consolidator)
+        async with repository.engine.begin() as connection:
+            await connection.exec_driver_sql(
+                "UPDATE memory_outbox SET status='processing', attempts=5, "
+                "locked_at=now()-interval '6 minutes' WHERE event_id=%s",
+                (receipt.event_id,),
+            )
+        assert await repository.claim_next_extraction() is None
+        await repository.run_maintenance(raw_event_retention_days=30)
+        exhausted = await repository.event_processing_status(scope, receipt.event_id)
+        assert exhausted.extraction_status == "failed"
+        assert exhausted.error_code == "lease_exhausted"
+        assert exhausted.attempts == 5
+    finally:
+        await repository.close()
 
 
 @pytest.mark.postgres
@@ -681,7 +1006,11 @@ async def test_concurrent_same_target_deletion_returns_one_job() -> None:
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_deletion_stops_after_five_failures(monkeypatch) -> None:
+@pytest.mark.parametrize("crash_on_last_attempt", [False, True])
+@pytest.mark.parametrize("by_event", [False, True])
+async def test_deletion_stops_after_five_attempts(
+    monkeypatch, crash_on_last_attempt: bool, by_event: bool
+) -> None:
     url = _test_database_url()
     _upgrade_test_database(url)
     repository = PostgresRepository.from_url(url)
@@ -701,13 +1030,25 @@ async def test_deletion_stops_after_five_failures(monkeypatch) -> None:
         memory_id = await repository.remember(
             scope, "失败删除目标", event.event_id, MemoryPolicy.version
         )
-        _, job_id = await repository.isolate_memories(scope, [memory_id])
+        submit = repository.prohibit_events if by_event else repository.isolate_memories
+        targets = [event.event_id if by_event else memory_id]
+        _, job_id = await submit(scope, targets)
 
-        async def fail_deletion(_):
+        apply_deletion = repository._apply_deletion
+
+        async def fail_deletion(row):
+            if row["attempts"] == 2:
+                stale = dict(row) | {"attempts": 1}
+                assert not await apply_deletion(stale)
+                await repository._fail_deletion(str(row["id"]), 1, "stale")
+                status = await repository.deletion_status(scope, str(row["id"]))
+                assert status.status == "processing"
+            if crash_on_last_attempt and row["attempts"] == 5:
+                raise asyncio.CancelledError
             raise RuntimeError("permanent failure")
 
         monkeypatch.setattr(repository, "_apply_deletion", fail_deletion)
-        for _ in range(5):
+        for _ in range(4 if crash_on_last_attempt else 5):
             with pytest.raises(RuntimeError):
                 await repository.process_one_deletion()
             async with repository.engine.begin() as connection:
@@ -715,14 +1056,43 @@ async def test_deletion_stops_after_five_failures(monkeypatch) -> None:
                     "UPDATE deletion_job SET available_at=now() WHERE id=%s",
                     (job_id,),
                 )
+        if crash_on_last_attempt:
+            with pytest.raises(asyncio.CancelledError):
+                await repository.process_one_deletion()
+            async with repository.engine.begin() as connection:
+                await connection.exec_driver_sql(
+                    "UPDATE deletion_job SET locked_at=now()-interval '6 minutes' WHERE id=%s",
+                    (job_id,),
+                )
+            assert not await repository.process_one_deletion()
+            await repository.run_maintenance(raw_event_retention_days=30)
         status = await repository.deletion_status(scope, job_id or "")
         no_more_work = await repository.process_one_deletion()
+        monkeypatch.setattr(repository, "_apply_deletion", apply_deletion)
+        if by_event:
+            with pytest.raises(NotFoundError):
+                await repository.isolate_memories(scope, [memory_id])
+            assert not await repository.process_one_deletion()
+        affected, retried_id = await submit(scope, targets)
+        assert affected == [memory_id]
+        assert retried_id and retried_id != job_id
+        assert await repository.process_one_deletion()
+        assert (await repository.deletion_status(scope, retried_id)).status == "completed"
+        async with repository.engine.connect() as connection:
+            erased = await connection.exec_driver_sql(
+                "SELECT NOT EXISTS (SELECT 1 FROM memory_item WHERE id=%s), "
+                "(SELECT content FROM memory_event WHERE id=%s)",
+                (memory_id, event.event_id),
+            )
+            assert tuple(erased.one()) == (
+                True, "[deleted-by-user]" if by_event else source.content
+            )
     finally:
         await repository.close()
 
     assert status.status == "failed"
     assert status.attempts == 5
-    assert status.error_code == "RuntimeError"
+    assert status.error_code == ("lease_exhausted" if crash_on_last_attempt else "RuntimeError")
     assert no_more_work is False
 
 
@@ -1082,6 +1452,38 @@ async def test_user_confirmed_procedure_is_scoped_correctable_and_task_matched()
         "remember_procedure",
         "correct_procedure",
     }
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_same_candidate_fingerprint_can_exist_in_distinct_layers() -> None:
+    repository = PostgresRepository.from_url(_test_app_database_url())
+    source = InteractionEvent(
+        tenant_id="tenant-a", user_id="user-a", agent_id="agent-a",
+        thread_id="thread-a", idempotency_key="shared-text",
+        source=EventSource.USER, content="我非常焦虑，提醒我明天下午参加会议",
+        occurred_at=datetime.now(UTC),
+    )
+    candidates = [
+        item.model_copy(update={"kind": "shared_kind"})
+        for item in HeuristicExtractor().extract(source)
+    ]
+    try:
+        receipt = await repository.record_event(source)
+        first = await repository.store_candidates(
+            receipt.event_id, source, candidates, MemoryPolicy.version
+        )
+        replay = await repository.store_candidates(
+            receipt.event_id, source, candidates, MemoryPolicy.version
+        )
+        items = await repository.list_memories(
+            MemoryListQuery(scope=MemoryScope(tenant_id="tenant-a", user_id="user-a", agent_id="agent-a"))
+        )
+    finally:
+        await repository.close()
+    assert len(set(first)) == 2
+    assert replay == first
+    assert {item.layer for item in items} == {MemoryLayer.WORKING, MemoryLayer.EPISODIC}
 
 
 @pytest.mark.postgres
@@ -1582,8 +1984,9 @@ async def test_candidate_decisions_are_auditable_without_candidate_text() -> Non
         thread_id="thread-a",
         idempotency_key=f"event-{uuid4()}",
         source=EventSource.USER,
-        content="请记住我的回答偏好",
+        content="请记住：我偏好简洁回答",
         occurred_at=datetime.now(UTC),
+        allow_memory_extraction=True,
     )
     candidates = [
         MemoryCandidate(
@@ -1619,10 +2022,28 @@ async def test_candidate_decisions_are_auditable_without_candidate_text() -> Non
     ]
     try:
         receipt = await repository.record_event(event)
-        await Consolidator(FixedExtractor(candidates), MemoryPolicy()).process(
-            repository,
-            EventJob(job_id=0, event_id=receipt.event_id, event=event, attempts=1),
-        )
+        worker = PostgresRepository.from_url(_test_database_url())
+        try:
+            first = await worker.claim_next_extraction()
+            assert first is not None and first.event_id == receipt.event_id
+            async with worker.engine.begin() as connection:
+                await connection.exec_driver_sql(
+                    "UPDATE memory_outbox SET locked_at=now()-interval '6 minutes' WHERE id=%s",
+                    (first.job_id,),
+                )
+            current = await worker.claim_next_extraction()
+            assert current is not None and current.attempts == first.attempts + 1
+            consolidator = Consolidator(FixedExtractor(candidates), MemoryPolicy())
+            assert await consolidator.process(worker, first) == []
+            assert await repository.list_candidate_decisions(scope, 10) == []
+            await worker.complete_extraction(first.job_id, first.attempts)
+            await worker.fail_extraction(first.job_id, first.attempts, "stale", terminal=True)
+            pending = await repository.event_processing_status(scope, receipt.event_id)
+            assert pending.extraction_status == "processing"
+            await consolidator.process(worker, current)
+            await worker.complete_extraction(current.job_id, current.attempts)
+        finally:
+            await worker.close()
         decisions = await repository.list_candidate_decisions(scope, 10)
         hidden = await repository.list_candidate_decisions(
             scope.model_copy(update={"user_id": "other-user"}), 10
@@ -1674,6 +2095,8 @@ async def test_candidate_decisions_are_auditable_without_candidate_text() -> Non
         )
         _, deletion_id = await reader.prohibit_events(scope, [receipt.event_id])
         assert deletion_id
+        assert (await reader.deletion_status(scope, deletion_id)).status == "pending"
+        assert await reader.list_candidate_decisions(scope, 10) == []
         worker = PostgresRepository.from_url(_test_database_url())
         try:
             assert await worker.process_one_deletion()

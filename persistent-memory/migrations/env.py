@@ -4,13 +4,19 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from memory_system.settings import require_verified_database_tls
+
 config = context.config
 if config.config_file_name:
     fileConfig(config.config_file_name)
 
 database_url = os.getenv("MEMORY_DATABASE_URL")
 if database_url:
-    config.set_main_option("sqlalchemy.url", database_url)
+    config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
+if os.getenv("MEMORY_ENVIRONMENT", "").lower() == "production":
+    require_verified_database_tls(
+        config.get_main_option("sqlalchemy.url") or "", "migration database URL"
+    )
 
 
 def run_migrations_offline() -> None:

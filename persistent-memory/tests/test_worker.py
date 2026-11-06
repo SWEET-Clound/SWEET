@@ -8,9 +8,9 @@ from memory_system.models import EventJob, EventSource, InteractionEvent, Memory
 from memory_system.policy import MemoryPolicy
 from memory_system.worker import (
     maintenance_loop,
+    process_extraction_iteration,
     process_one_deletion,
     process_one_extraction,
-    process_worker_iteration,
     run_worker,
     worker_loop,
 )
@@ -42,16 +42,18 @@ class StubJobRepository:
         policy_version,
         status="active",
         decisions=None,
+        *,
+        job=None,
     ):
         self.saved.extend(candidates)
         self.write_statuses.append(status)
         self.decisions.extend(decisions or [])
         return ["00000000-0000-0000-0000-000000000010"]
 
-    async def complete_extraction(self, job_id):
+    async def complete_extraction(self, job_id, attempts):
         self.completed.append(job_id)
 
-    async def fail_extraction(self, job_id, error_code):
+    async def fail_extraction(self, job_id, attempts, error_code, *, terminal=False):
         self.failed.append(job_id)
 
 
@@ -122,7 +124,7 @@ async def test_database_failure_does_not_escape_worker_iteration() -> None:
         async def claim_next_extraction(self):
             raise ConnectionError("database unavailable")
 
-    worked = await process_worker_iteration(
+    worked = await process_extraction_iteration(
         TemporarilyUnavailableRepository(),
         Consolidator(HeuristicExtractor(), MemoryPolicy()),
     )
@@ -145,21 +147,20 @@ async def test_worker_refuses_to_fall_back_to_api_database_role(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_worker_finishes_current_iteration_before_stopping(monkeypatch) -> None:
+async def test_worker_finishes_current_iteration_before_stopping() -> None:
     started = asyncio.Event()
     release = asyncio.Event()
     stop_event = asyncio.Event()
     calls = 0
 
-    async def iteration(repository, consolidator):
+    async def iteration():
         nonlocal calls
         calls += 1
         started.set()
         await release.wait()
         return True
 
-    monkeypatch.setattr("memory_system.worker.process_worker_iteration", iteration)
-    task = asyncio.create_task(worker_loop(None, None, 60, stop_event))
+    task = asyncio.create_task(worker_loop(iteration, 60, stop_event))
     await started.wait()
 
     stop_event.set()
@@ -188,3 +189,49 @@ async def test_stop_event_interrupts_maintenance_wait() -> None:
 
     stop_event.set()
     await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_run_worker_processes_deletions_while_extraction_is_waiting(monkeypatch) -> None:
+    extracting = asyncio.Event()
+    release = asyncio.Event()
+    deleted = asyncio.Event()
+    stop = asyncio.Event()
+
+    class Repository:
+        async def claim_next_extraction(self):
+            extracting.set()
+            await release.wait()
+
+        async def process_one_deletion(self):
+            await extracting.wait()
+            deleted.set()
+            return False
+
+        async def run_maintenance(self, retention_days):
+            pass
+
+        async def close(self):
+            pass
+
+    for key, value in {
+        "DATABASE_URL": "postgresql+psycopg://worker/memory",
+        "WORKER_DATABASE_URL": "postgresql+psycopg://worker/memory",
+        "JWT_ISSUER": "issuer",
+        "JWT_AUDIENCE": "audience",
+        "DEV_JWT_SECRET": "development-only-secret-at-least-32-characters",
+        "WORKER_CONCURRENCY": "1",
+    }.items():
+        monkeypatch.setenv(f"MEMORY_{key}", value)
+    monkeypatch.setattr("memory_system.worker.check_worker_database", lambda _: None)
+    monkeypatch.setattr(
+        "memory_system.worker.PostgresRepository.from_url", lambda _, **kwargs: Repository()
+    )
+    task = asyncio.create_task(run_worker(stop))
+    try:
+        await asyncio.wait_for(deleted.wait(), timeout=2)
+        assert not release.is_set()
+    finally:
+        stop.set()
+        release.set()
+        await asyncio.wait_for(task, timeout=2)

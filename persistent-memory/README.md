@@ -73,6 +73,15 @@ docker compose exec api memory-dev-token
 所有写请求必须携带 `Idempotency-Key`。同一个 key 和相同 payload 返回原结果；同一个
 key 对应不同 payload 返回 `409`。
 
+Python 调用方可使用 `memory_system.client.MemoryClient`。传入自行管理的 `httpx.Client`，
+并为其配置 API 地址、Bearer token 和超时。客户端提供事件写入、召回、显式命令和删除状态
+查询，返回类型化结果。调用方负责重试，重试写入时复用原幂等键。
+
+`import_events` 逐条回放 `(EventRequest, 幂等键)` 并返回回执。中途失败时，已成功的写入
+保留，用原键重跑即可。`iter_memories` 分页导出当前身份可见的活跃记忆摘要。
+摘要可能包含个人内容，应按业务数据保管。事件导入会走正常抽取策略，摘要导出不包含原始
+交互正文，也不用于原样恢复历史版本和证据关系。
+
 首次幂等写入还受 PostgreSQL 原子限流保护：默认每个 `tenant/user/agent` scope 每分钟最多
 120 个新事件和 30 个新记忆写入或纠正命令。忘记和禁止记忆命令不占用这项配额。
 可用 `MEMORY_EVENT_WRITE_LIMIT_PER_MINUTE`、
@@ -109,7 +118,8 @@ MEMORY_MODEL_MAX_ATTEMPTS=2
 
 模型必须返回结构化候选；输出经过 Pydantic、来源、敏感性、层级、TTL 和投毒策略复核，
 模型没有数据库写权限。`shadow` 把通过门控的模型候选写为 `quarantined`，不参与召回；可用
-`GET /v1/memory/items?statuses=quarantined` 查看候选，再通过 review 端点批准或拒绝；两种
+`GET /v1/memory/items?statuses=quarantined` 查看候选，再通过 review 端点批准或拒绝。读取
+`quarantined` 或 `rejected` 列表也需要 `review` purpose；两种审核
 决定都写入审计。审核达到业务阈值后，`hybrid` 合并确定性规则和模型结果，`model` 仅使用
 模型结果。
 
@@ -133,9 +143,11 @@ MEMORY_MODEL_MAX_ATTEMPTS=2
 - worker 使用 `FOR UPDATE SKIP LOCKED`、租约恢复和最多五次指数退避；多副本 maintenance
   通过 PostgreSQL advisory lock 保证同一时刻只运行一次；Compose healthcheck 使用 worker
   专用角色执行真实数据库探测；SIGINT/SIGTERM 会停止领取新任务、等待当前 iteration/事务
-  完成并关闭连接，Compose 提供 45 秒停机宽限；
+  完成并关闭连接，Compose 提供 45 秒停机宽限。每个 worker 进程单独轮询物理删除任务，
+  即使抽取并发全部在等模型响应，删除仍可继续；
 - 删除先把记忆同步标为 `deleting`，随后 worker 删除记忆和证据，并把指定原始事件擦成
-  不可召回 tombstone；完成前 canary 会验证记忆已消失且事件已被擦除，失败则整笔事务回滚
+  不可召回 tombstone；完成前 canary 会验证记忆、向量、证据链接、候选决策和相关召回诊断
+  已移除，且指定事件已被擦除，失败则整笔事务回滚
   并重试；保留 payload hash 是为了阻止同一幂等请求把已删内容复活；
 - 到期的 L1/其他临时记忆转为 `expired`；L2 转为 `archived`，不参与普通召回，但仍可在
   `history` 目的下按时间和证据查询，等待复核或后续保留策略处理；
@@ -180,6 +192,10 @@ memory-eval
 情绪、限时事件、非用户来源、凭证/卡号/医疗信息和提示注入。它是防回归基线，不等同于
 真实业务金标；上线前仍需加入经过人工标注的真实分布样本。
 
+运行 `memory-eval --configured-extractor [金标路径]` 可使用 worker 的抽取配置。
+模型模式会把通过输入过滤的样本文本发给配置的模型服务，并按通过写入策略的候选层级评分。
+默认使用内置合成样本，自定义文件应先脱敏并确认获准发送。
+
 真实数据库测试要求 owner URL `MEMORY_TEST_DATABASE_URL` 和 RLS 受限角色 URL
 `MEMORY_TEST_APP_DATABASE_URL` 都指向名称以 `_test` 结尾的同一个可丢弃数据库；测试会自动
 执行 migration：
@@ -201,10 +217,66 @@ pytest -q -m postgres
 - 在网关或反向代理设置请求体上限；应用层字段上限不能避免服务器先缓冲超大 HTTP body；
 - 按真实用户行为校准应用写入阈值，并在网关设置 IP/客户端级连接与请求速率限制；数据库
   scope 限流不能阻止认证前 DDoS，也不能替代异常告警；
-- 配置 PostgreSQL 备份、PITR、TLS、连接池、集中日志和告警；
+- API 与 worker 的生产数据库 URL 必须指定 `sslmode=verify-full`。数据库主机名应与证书
+  匹配，并按部署环境配置可信 CA。运行迁移时同样设置 `MEMORY_ENVIRONMENT=production`，
+  迁移入口会执行相同校验。另需配置备份、PITR、
+  连接池、集中日志和告警；
 - 用真实业务金标评估误存、漏存、跨用户隔离、删除完成率和召回质量；
 - 在启用模型抽取前运行 shadow mode，并由产品、安全和法务确认敏感类别与保留期。
 
+### 逻辑备份与恢复演练
+
+用 PostgreSQL 客户端连接配置提供地址、TLS 和凭据。备份文件包含业务数据，应存放在受控位置。
+
+```bash
+pg_dump --dbname=service=memory_backup --format=custom --file=memory.dump
+pg_restore --dbname=service=memory_restore --exit-on-error --single-transaction memory.dump
+```
+
+恢复目标使用单独的空数据库。先创建备份中引用的数据库角色，再恢复并检查
+`alembic_version`、业务样本、RLS 和角色权限。演练通过后，使用应用与 worker 角色跑一次
+写入、召回和删除闭环。逻辑备份只能恢复到快照时点，PITR 还需要物理基备与连续 WAL 归档。
+
 第一版有意不包含 Redis、Kafka、Celery、Neo4j、独立向量数据库或自动 L4。当前召回使用
 PostgreSQL FTS、中文 trigram、精确 subject、最近情景和 L3/L1 场景候选，并以 RRF 融合；
-Compose 已使用 pgvector 官方镜像，但向量列和 embedding 仍需选定模型维度并通过金标后启用。
+配置 `MEMORY_EMBEDDING_MODEL`、`MEMORY_EMBEDDING_DIMENSIONS` 和
+`MEMORY_MODEL_BASE_URL` 后，worker 每个维护周期最多向配置的网关发送 16 条符合条件的
+L2/L3 记忆正文以生成向量。默认关闭，启用前确认网关可接收这些数据。
+API 使用同一配置生成查询向量，并将语义候选融入召回。查询命中敏感内容规则或网关调用
+失败时继续使用词法、主题键和时间候选。当前对同一范围内的合格向量做精确余弦比较，
+生产启用前应测量真实语料上的召回质量、延迟和模型费用。
+
+迁移 `20261106_0015` 后，可向 API 和 worker 同时注入同一个
+`MEMORY_EVENT_ENCRYPTION_KEY`（标准 Base64 编码的 32 字节随机密钥）。
+生产模式要求配置该密钥，API 和 worker 启动时会拒绝缺失或无效的密钥。
+也可以由平台把密钥挂载为只读文件，设置 `MEMORY_EVENT_ENCRYPTION_KEY_FILE`
+和轮换时的 `MEMORY_EVENT_ENCRYPTION_FALLBACK_KEY_FILE` 指向文件路径。
+同一把密钥只能配置直接值或文件路径之一，更新挂载后需重启进程以重新读取。
+启用后，新写入的原始事件正文和元数据以 AES-256-GCM 密文保存。删除与保留期清理会清空密文。
+由部署平台的 secret 管理器分发密钥，迁移期间先停止旧版写入者。应用迁移
+`20261106_0016` 后，启用加密的 worker 每次维护最多转换 32 条历史明文事件，
+跳过已脱敏或被其他事务锁定的事件。待回填数量可用
+`SELECT count(*) FROM memory_event WHERE ciphertext IS NULL AND redacted_at IS NULL` 核对。
+转换前的明文仍可能存在于旧页、WAL、备份及副本中。派生记忆正文和检索索引仍需单独保护。
+迁移 `20261106_0017` 后可以轮换密钥。先让所有 API 和 worker 保持旧主密钥，
+同时用 `MEMORY_EVENT_ENCRYPTION_FALLBACK_KEY` 加载新密钥。确认两把密钥均已部署后，
+互换主密钥和备用密钥。所有写入者切换到新主密钥后，在 worker 开启
+`MEMORY_EVENT_ENCRYPTION_ROTATE=true`，每轮维护最多转换 32 条非当前密钥的原始事件。
+当所有未脱敏行的 `ciphertext_key_id` 都等于当前密钥的 SHA-256 十六进制前 32 字符时，
+可关闭轮换并从在线服务移除旧备用密钥。含旧密文的备份恢复仍需要旧密钥。
+迁移 `20261106_0018` 后，解密失败的行保留原密文并延后一小时重试。
+`memory_event_rotation_deferred` 日志记录批次中的失败数，其余行继续处理。
+撤下旧密钥前，应核对所有未脱敏行的密钥标识，包括仍在等待重试的行。
+
+配置 `MEMORY_RERANK_MODEL` 和 `MEMORY_MODEL_BASE_URL` 可启用可选模型重排。
+网关需在基础地址下提供 `POST /rerank`，接收 `model`、`query` 和字符串数组 `documents`，
+按相关性从高到低返回 `{"results":[{"index":1},{"index":0}]}`，每个输入索引恰好出现一次。
+服务最多发送 16 条低敏、无冲突且已命中查询的 L2/L3 候选正文。精确主题命中保留原位置。
+启用前确认网关可以接收查询和记忆正文。网关错误或返回无效索引时沿用原有顺序，
+并增加 `memory_rerank_fallbacks_total`。
+
+`memory_recall_outcomes_total{purpose,outcome}` 统计有查询文本的召回请求在打包后的结果。
+`matched` 表示至少一条查询命中，`context_only` 表示只选到了包含情景候选的兜底上下文，
+`profile_only` 表示只选到核心画像，`empty` 表示未选中任何记忆。持续升高的
+`context_only` 比例可用于排查跨主题召回或相关候选被预算挤出的情况。它是诊断信号，
+无法单独证明语义无关。指标标签仅含用途和结果，不包含用户标识、查询或记忆正文。

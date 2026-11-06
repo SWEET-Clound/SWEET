@@ -1,9 +1,12 @@
+import asyncio
 from collections.abc import Sequence
 from datetime import datetime
 from uuid import uuid4
 
+import httpx
 from prometheus_client import Counter
 
+from memory_system.embedding import EmbeddingClient
 from memory_system.models import (
     AuditEntry,
     CandidateDecisionAudit,
@@ -26,6 +29,7 @@ from memory_system.models import (
 )
 from memory_system.policy import MemoryPolicy
 from memory_system.postgres import PostgresRepository
+from memory_system.rerank import RerankClient
 from memory_system.retrieval import pack_context, render_data_only
 
 _CONTEXT_BUILDS = Counter(
@@ -38,7 +42,18 @@ _CONTEXT_ITEMS = Counter(
     "Memory items packed into contexts",
     ("purpose",),
 )
+_RECALL_OUTCOMES = Counter(
+    "memory_recall_outcomes_total",
+    "Query recall outcomes after context packing",
+    ("purpose", "outcome"),
+)
 _PROFILE_TOKEN_BUDGET = 512
+_EMBEDDING_FALLBACKS = Counter(
+    "memory_query_embedding_fallbacks_total", "Query embeddings unavailable during recall"
+)
+_RERANK_FALLBACKS = Counter(
+    "memory_rerank_fallbacks_total", "Reranking unavailable during recall"
+)
 
 
 class MemoryPolicyRejected(Exception):
@@ -53,10 +68,14 @@ class MemorySystem:
         repository: PostgresRepository,
         policy: MemoryPolicy,
         max_context_tokens: int,
+        embedding_client: EmbeddingClient | None = None,
+        rerank_client: RerankClient | None = None,
     ) -> None:
         self.repository = repository
         self.policy = policy
         self.max_context_tokens = max_context_tokens
+        self.embedding_client = embedding_client
+        self.rerank_client = rerank_client
 
     async def record_event(self, event: InteractionEvent) -> RecordReceipt:
         return await self.repository.record_event(event)
@@ -68,10 +87,38 @@ class MemorySystem:
         profile_items, profile_truncated = pack_context(
             profile_candidates, min(budget, _PROFILE_TOKEN_BUDGET)
         )
-        recalled = await self.repository.search(
-            scope, request.query, request.purpose, request.now
+        search_args = (scope, request.query, request.purpose, request.now)
+        embedder = self.embedding_client
+        vector = None
+        model_query_allowed = (
+            budget > 0 and bool(request.query.strip())
+            and self.policy.evaluate_explicit_memory(request.query).allowed
         )
+        if embedder is not None and model_query_allowed:
+            try:
+                vector, = await asyncio.to_thread(embedder.embed, [request.query])
+            except (httpx.HTTPError, ValueError):
+                _EMBEDDING_FALLBACKS.inc()
+        if vector is not None and embedder is not None:
+            recalled = await self.repository.search(
+                *search_args, embedding_model=embedder.model, query_embedding=vector
+            )
+        else:
+            recalled = await self.repository.search(*search_args)
         matched = [item for item in recalled if item.query_matched]
+        if self.rerank_client is not None and model_query_allowed:
+            positions = [i for i, item in enumerate(matched) if item.rerank_eligible][:16]
+            if len(positions) > 1:
+                eligible = [matched[i] for i in positions]
+                try:
+                    order = await self.rerank_client.rank(
+                        request.query, [item.statement for item in eligible]
+                    )
+                except (httpx.HTTPError, ValueError):
+                    _RERANK_FALLBACKS.inc()
+                else:
+                    for position, index in zip(positions, order, strict=True):
+                        matched[position] = eligible[index]
         matched_ids = {item.memory_id for item in matched}
         profile_ids = {item.memory_id for item in profile_items}
         candidates = matched + [
@@ -95,6 +142,16 @@ class MemorySystem:
             purpose=request.purpose, truncated=str(truncated).lower()
         ).inc()
         _CONTEXT_ITEMS.labels(purpose=request.purpose).inc(len(selected))
+        if request.query.strip():
+            if any(item.query_matched for item in selected):
+                outcome = "matched"
+            elif any(item.memory_id not in profile_ids for item in selected):
+                outcome = "context_only"
+            elif selected:
+                outcome = "profile_only"
+            else:
+                outcome = "empty"
+            _RECALL_OUTCOMES.labels(purpose=request.purpose, outcome=outcome).inc()
         return MemoryContext(
             items=selected,
             rendered_text=render_data_only(selected),

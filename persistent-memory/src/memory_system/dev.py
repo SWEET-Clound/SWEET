@@ -10,6 +10,8 @@ import psycopg
 from alembic import command
 from alembic.config import Config
 
+from memory_system.client import MemoryClient
+from memory_system.models import EventRequest, EventSource, ForgetRequest, RecallRequestBody
 from memory_system.settings import Settings
 
 
@@ -81,6 +83,7 @@ def worker_health_main() -> None:
     settings = Settings()  # type: ignore[call-arg]
     if settings.worker_database_url is None:
         raise RuntimeError("MEMORY_WORKER_DATABASE_URL is required")
+    settings.build_event_cipher()
     check_worker_database(settings.worker_database_url.get_secret_value())
 
 
@@ -96,9 +99,11 @@ def check_worker_database(database_url: str) -> None:
             raise RuntimeError("memory worker requires a database role with BYPASSRLS")
         connection.execute(
             """
-            SELECT 1 FROM memory_outbox, deletion_job, memory_event, memory_item,
+            SELECT memory_event.ciphertext, memory_event.ciphertext_key_id,
+                   memory_event.ciphertext_retry_at
+            FROM memory_outbox, deletion_job, memory_event, memory_item,
                           memory_candidate_decision, memory_recall_diagnostic,
-                          memory_write_rate_limit
+                          memory_write_rate_limit, memory_embedding
             LIMIT 0
             """
         )
@@ -116,17 +121,16 @@ def smoke_main() -> None:
     command_key = f"smoke-command-{uuid4()}"
 
     with httpx.Client(base_url=args.base_url, headers=headers, timeout=5) as client:
-        event_response = client.post(
-            "/v1/memory/events",
-            headers={"Idempotency-Key": event_key},
-            json={
-                "thread_id": "smoke-thread",
-                "source": "user",
-                "content": "请记住：我喜欢简洁回答",
-                "occurred_at": datetime.now(UTC).isoformat(),
-            },
+        memory = MemoryClient(client)
+        memory.record_event(
+            EventRequest(
+                thread_id="smoke-thread",
+                source=EventSource.USER,
+                content="请记住：我喜欢简洁回答",
+                occurred_at=datetime.now(UTC),
+            ),
+            event_key,
         )
-        event_response.raise_for_status()
 
         deadline = time.monotonic() + args.timeout
         memories = []
@@ -140,31 +144,26 @@ def smoke_main() -> None:
         if not memories:
             raise RuntimeError("worker did not create the automatic memory before timeout")
 
-        context_response = client.post(
-            "/v1/memory/context:build",
-            json={
-                "thread_id": "smoke-thread",
-                "query": "我的回答偏好是什么？",
-                "purpose": "conversation",
-                "token_budget": 512,
-                "request_time": datetime.now(UTC).isoformat(),
-            },
+        context = memory.build_context(
+            RecallRequestBody(
+                thread_id="smoke-thread",
+                query="我的回答偏好是什么？",
+                purpose="conversation",
+                token_budget=512,
+                request_time=datetime.now(UTC),
+            )
         )
-        context_response.raise_for_status()
-        if not context_response.json()["items"]:
+        if not context.items:
             raise RuntimeError("stored memory was not recalled")
 
-        forget_response = client.post(
-            "/v1/memory/commands",
-            headers={"Idempotency-Key": command_key},
-            json={"action": "forget", "memory_ids": [memories[0]["memory_id"]]},
+        forget = memory.execute_command(
+            ForgetRequest(action="forget", memory_ids=[memories[0]["memory_id"]]), command_key
         )
-        forget_response.raise_for_status()
-        deletion_job_id = forget_response.json()["deletion_job_id"]
+        deletion_job_id = forget.deletion_job_id
+        if not deletion_job_id:
+            raise RuntimeError("forget command did not schedule deletion")
         while time.monotonic() < deadline:
-            status_response = client.get(f"/v1/memory/deletions/{deletion_job_id}")
-            status_response.raise_for_status()
-            if status_response.json()["status"] == "completed":
+            if memory.deletion_status(deletion_job_id).status == "completed":
                 print("smoke ok: event -> automatic memory -> recall -> deletion")
                 return
             time.sleep(0.25)

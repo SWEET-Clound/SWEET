@@ -14,7 +14,7 @@ from memory_system.models import (
     MemoryCandidate,
     MemoryLayer,
 )
-from memory_system.policy import REMEMBER_PREFIX, MemoryPolicy, explicitly_opts_out
+from memory_system.policy import EPISODIC_TTL, REMEMBER_PREFIX, MemoryPolicy, explicitly_opts_out
 
 _NEGATIVE_HIGH_AROUSAL = (
     "特别难过",
@@ -100,7 +100,7 @@ class HeuristicExtractor:
                     utility="high",
                     durability="uncertain",
                     confidence=0.85,
-                    expires_at=event.occurred_at + timedelta(days=180),
+                    expires_at=event.occurred_at + EPISODIC_TTL,
                 )
             )
         return candidates
@@ -179,6 +179,7 @@ class Consolidator:
             self.policy.version,
             self.write_status,
             decisions,
+            job=job,
         )
 
 
@@ -187,7 +188,7 @@ class HybridExtractor:
         self.extractors = extractors
 
     def extract(self, event: InteractionEvent) -> list[MemoryCandidate]:
-        unique: dict[tuple[str, str], MemoryCandidate] = {}
+        unique: dict[tuple[MemoryLayer, str], MemoryCandidate] = {}
         succeeded = False
         last_error: Exception | None = None
         for extractor in self.extractors:
@@ -202,10 +203,9 @@ class HybridExtractor:
                 continue
             succeeded = True
             for candidate in candidates:
-                key = (candidate.kind, " ".join(candidate.statement.lower().split()))
-                current = unique.get(key)
-                if current is None or candidate.confidence > current.confidence:
-                    unique[key] = candidate
+                key = (candidate.proposed_layer, " ".join(candidate.statement.lower().split()))
+                # The worker supplies its deterministic extractor first.
+                unique.setdefault(key, candidate)
         if not succeeded and last_error is not None:
             raise last_error
         return list(unique.values())

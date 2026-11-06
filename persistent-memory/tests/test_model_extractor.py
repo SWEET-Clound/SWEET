@@ -5,7 +5,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from memory_system.llm import OpenAICompatibleExtractor
+from memory_system.llm import ModelResponseTooLarge, OpenAICompatibleExtractor
 from memory_system.models import EventSource, InteractionEvent, MemoryCandidate, MemoryLayer
 
 
@@ -67,6 +67,25 @@ def _empty_response() -> dict:
     }
 
 
+def test_oversized_model_response_is_not_retried(monkeypatch) -> None:
+    monkeypatch.setattr("memory_system.llm._MAX_RESPONSE_BYTES", 16)
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=b"x" * 17)
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as client,
+        pytest.raises(ModelResponseTooLarge),
+    ):
+        OpenAICompatibleExtractor("http://model.test/v1", "extractor", None, client=client).extract(
+            _event()
+        )
+    assert calls == 1
+
+
 def test_model_extractor_accepts_only_structured_candidates() -> None:
     response = {
         "choices": [
@@ -125,8 +144,14 @@ def test_model_extractor_accepts_only_structured_candidates() -> None:
     assert candidates[0].future_utility == "high"
 
 
-def test_candidate_rejects_unknown_sensitivity_class() -> None:
-    with pytest.raises(ValidationError):
+@pytest.mark.parametrize(("field", "value"), [
+    ("sensitivity", "unknown-secret-class"),
+    ("kind", "x" * 65),
+    ("subject_key", "x" * 257),
+    ("poisoning_flags", ["flag"] * 9),
+])
+def test_candidate_rejects_invalid_governance_metadata(field, value) -> None:
+    with pytest.raises(ValidationError) as exc:
         MemoryCandidate.model_validate(
             {
                 "statement": "candidate",
@@ -141,10 +166,12 @@ def test_candidate_rejects_unknown_sensitivity_class() -> None:
                 "future_utility": "medium",
                 "durability": "uncertain",
                 "affect": None,
-                "sensitivity": "unknown-secret-class",
+                "sensitivity": "low",
                 "poisoning_flags": [],
+                field: value,
             }
         )
+    assert exc.value.errors()[0]["loc"][0] == field
 
 
 def test_model_extractor_retries_retryable_status_then_succeeds() -> None:

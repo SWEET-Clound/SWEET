@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
+import structlog
+from cryptography.exceptions import InvalidTag
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
+from memory_system.event_cipher import EventCipher
 from memory_system.models import (
     AuditEntry,
     CandidateDecision,
@@ -48,6 +52,18 @@ class NotFoundError(Exception):
     pass
 
 
+class MemoryDeletionInProgress(Exception):
+    pass
+
+
+class DeletionCanaryFailed(RuntimeError):
+    pass
+
+
+class EventPayloadUnreadable(RuntimeError):
+    pass
+
+
 class RateLimitExceeded(Exception):
     def __init__(self, operation: str, retry_after_seconds: int = 60) -> None:
         self.operation = operation
@@ -61,10 +77,14 @@ class PostgresRepository:
         engine: AsyncEngine,
         event_write_limit_per_minute: int = 120,
         command_write_limit_per_minute: int = 30,
+        event_cipher: EventCipher | None = None,
+        rotate_event_ciphertext: bool = False,
     ) -> None:
         self.engine = engine
         self.event_write_limit_per_minute = event_write_limit_per_minute
         self.command_write_limit_per_minute = command_write_limit_per_minute
+        self.event_cipher = event_cipher
+        self.rotate_event_ciphertext = rotate_event_ciphertext
 
     @classmethod
     def from_url(
@@ -72,11 +92,15 @@ class PostgresRepository:
         database_url: str,
         event_write_limit_per_minute: int = 120,
         command_write_limit_per_minute: int = 30,
+        event_cipher: EventCipher | None = None,
+        rotate_event_ciphertext: bool = False,
     ) -> PostgresRepository:
         return cls(
             create_async_engine(database_url, pool_pre_ping=True),
             event_write_limit_per_minute,
             command_write_limit_per_minute,
+            event_cipher,
+            rotate_event_ciphertext,
         )
 
     async def close(self) -> None:
@@ -87,15 +111,81 @@ class PostgresRepository:
             await connection.execute(
                 text(
                     """
-                    SELECT 1
+                    SELECT memory_event.ciphertext, memory_event.ciphertext_key_id,
+                           memory_event.ciphertext_retry_at
                     FROM memory_event, memory_item, memory_outbox, memory_evidence,
                          command_dedup, deletion_job, memory_relation, memory_audit,
                          memory_candidate_decision, memory_recall_diagnostic,
-                         memory_write_rate_limit
+                         memory_write_rate_limit, memory_embedding
                     LIMIT 0
                     """
                 )
             )
+
+    @asynccontextmanager
+    async def embedding_backfill_lock(self, model: str, dimensions: int) -> AsyncIterator[bool]:
+        key = f"persistent-memory-embedding:{dimensions}:{model}"
+        async with self.engine.begin() as connection:
+            lock = await connection.execute(
+                text("SELECT pg_try_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": key},
+            )
+            yield lock.scalar_one()
+
+    async def pending_embeddings(self, model: str, dimensions: int) -> list[tuple[str, str]]:
+        async with self.engine.connect() as connection:
+            result = await connection.execute(
+                text(
+                    """
+                    SELECT m.id, m.statement FROM memory_item m
+                    WHERE m.status='active' AND m.layer IN ('L2','L3')
+                      AND m.sensitivity IN ('low','medium')
+                      AND cardinality(m.poisoning_flags)=0
+                      AND (m.expires_at IS NULL OR m.expires_at>now())
+                      AND NOT EXISTS (
+                        SELECT 1 FROM memory_embedding e WHERE e.memory_id=m.id
+                          AND e.model=:model AND e.dimensions=:dimensions
+                      )
+                    ORDER BY m.created_at, m.id LIMIT 16
+                    """
+                ),
+                {"model": model, "dimensions": dimensions},
+            )
+            return [(str(row.id), row.statement) for row in result]
+
+    async def store_embedding(
+        self, memory_id: str, statement: str, model: str, vector: list[float]
+    ) -> bool:
+        async with self.engine.begin() as connection:
+            stored = await connection.execute(
+                text(
+                    """
+                    WITH eligible AS (
+                        SELECT id FROM memory_item
+                        WHERE id=:id AND statement=:statement AND status='active'
+                          AND layer IN ('L2','L3')
+                          AND sensitivity IN ('low','medium')
+                          AND cardinality(poisoning_flags)=0
+                          AND (expires_at IS NULL OR expires_at>now())
+                        FOR UPDATE
+                    )
+                    INSERT INTO memory_embedding (memory_id, model, dimensions, embedding)
+                    SELECT id, :model, :dimensions, CAST(:embedding AS real[])
+                    FROM eligible
+                    ON CONFLICT (memory_id, model, dimensions) DO UPDATE
+                    SET embedding=EXCLUDED.embedding
+                    RETURNING memory_id
+                    """
+                ),
+                {
+                    "id": memory_id,
+                    "statement": statement,
+                    "model": model,
+                    "dimensions": len(vector),
+                    "embedding": vector,
+                },
+            )
+            return stored.first() is not None
 
     async def record_event(self, event: InteractionEvent) -> RecordReceipt:
         canonical_payload = json.dumps(
@@ -119,7 +209,16 @@ class PostgresRepository:
             "payload_hash": payload_hash,
             "opted_out": opted_out,
             "metadata": json.dumps(event.metadata, ensure_ascii=False),
+            "ciphertext": None,
+            "ciphertext_key_id": None,
         }
+        if self.event_cipher is not None:
+            params.update(
+                content="",
+                metadata="{}",
+                ciphertext=self.event_cipher.encrypt(event_id, event.content, event.metadata),
+                ciphertext_key_id=self.event_cipher.key_id,
+            )
         async with self.engine.begin() as connection:
             await self._set_scope(connection, event_scope(event))
             inserted = await connection.execute(
@@ -127,11 +226,12 @@ class PostgresRepository:
                     """
                     INSERT INTO memory_event (
                         id, tenant_id, user_id, agent_id, thread_id, idempotency_key,
-                        payload_hash, source, content, occurred_at, metadata, prohibited_from_memory
+                        payload_hash, source, content, occurred_at, metadata,
+                        ciphertext, ciphertext_key_id, prohibited_from_memory
                     ) VALUES (
                         :id, :tenant_id, :user_id, :agent_id, :thread_id, :idempotency_key,
                         :payload_hash, :source, :content, :occurred_at, CAST(:metadata AS jsonb),
-                        :opted_out
+                        :ciphertext, :ciphertext_key_id, :opted_out
                     )
                     ON CONFLICT (tenant_id, user_id, agent_id, idempotency_key) DO NOTHING
                     RETURNING id
@@ -243,7 +343,7 @@ class PostgresRepository:
                     """
                     WITH picked AS (
                         SELECT id FROM memory_outbox
-                        WHERE kind='extract'
+                        WHERE kind='extract' AND attempts < 5
                           AND (
                             (status IN ('pending','retry') AND available_at <= now())
                             OR (status='processing' AND locked_at < now() - interval '5 minutes')
@@ -267,19 +367,31 @@ class PostgresRepository:
                 text(
                     """
                     SELECT tenant_id, user_id, agent_id, thread_id, idempotency_key,
-                           source, content, occurred_at, metadata
+                           source, content, occurred_at, metadata, ciphertext
                     FROM memory_event WHERE id=:event_id
                     """
                 ),
                 {"event_id": job["event_id"]},
             )
             event = result.mappings().one()
-            return EventJob(
-                job_id=job["id"],
-                event_id=str(job["event_id"]),
-                attempts=job["attempts"],
-                event=InteractionEvent.model_validate(event),
-            )
+        event_id = str(job["event_id"])
+        try:
+            payload = InteractionEvent.model_validate(self._event_payload(event_id, event))
+        except (InvalidTag, ValueError):
+            await self.fail_extraction(job["id"], job["attempts"], "EventPayloadUnreadable")
+            raise EventPayloadUnreadable("could not decode extraction event") from None
+        return EventJob(
+            job_id=job["id"], event_id=event_id, attempts=job["attempts"], event=payload
+        )
+
+    def _event_payload(self, event_id: str, row: Any) -> dict[str, Any]:
+        payload = dict(row)
+        ciphertext = payload.pop("ciphertext")
+        if ciphertext is not None:
+            if self.event_cipher is None:
+                raise ValueError("event encryption key is required to read this event")
+            payload.update(self.event_cipher.decrypt(event_id, ciphertext))
+        return payload
 
     async def store_candidates(
         self,
@@ -289,10 +401,12 @@ class PostgresRepository:
         policy_version: str,
         status: str = "active",
         decisions: list[CandidateDecision] | None = None,
+        *,
+        job: EventJob | None = None,
     ) -> list[str]:
         scope = event_scope(event)
         stored: list[str] = []
-        stored_by_fingerprint: dict[str, str] = {}
+        stored_by_fingerprint: dict[tuple[MemoryLayer, str], str] = {}
         async with self.engine.begin() as connection:
             await self._set_scope(connection, scope)
             source = await connection.execute(
@@ -309,6 +423,16 @@ class PostgresRepository:
             source_row = source.mappings().first()
             if source_row is None or source_row["prohibited_from_memory"]:
                 return []
+            if job is not None:
+                lease = await connection.execute(
+                    text(
+                        "SELECT id FROM memory_outbox WHERE id=:id AND event_id=:event_id "
+                        "AND status='processing' AND attempts=:attempts FOR UPDATE"
+                    ),
+                    {"id": job.job_id, "event_id": event_id, "attempts": job.attempts},
+                )
+                if lease.first() is None:
+                    return []
             for candidate in candidates:
                 conflict_eligible = (
                     status == "active"
@@ -340,7 +464,7 @@ class PostgresRepository:
                             CAST(:affect AS jsonb), :subject_key, :sensitivity,
                             CAST(:poisoning_flags AS text[])
                         )
-                        ON CONFLICT (tenant_id, user_id, agent_id, fingerprint)
+                        ON CONFLICT (tenant_id, user_id, agent_id, layer, fingerprint)
                         WHERE fingerprint IS NOT NULL
                         DO UPDATE SET
                             confidence=GREATEST(memory_item.confidence, EXCLUDED.confidence),
@@ -354,6 +478,7 @@ class PostgresRepository:
                             sensitivity=EXCLUDED.sensitivity,
                             poisoning_flags=EXCLUDED.poisoning_flags,
                             updated_at=now()
+                        WHERE memory_item.status <> 'deleting'
                         RETURNING id
                         """
                     ),
@@ -378,8 +503,11 @@ class PostgresRepository:
                         **scope.model_dump(),
                     },
                 )
-                stored_id = str(row.scalar_one())
-                stored_by_fingerprint[fingerprint] = stored_id
+                returned_id = row.scalar_one_or_none()
+                if returned_id is None:
+                    raise MemoryDeletionInProgress()
+                stored_id = str(returned_id)
+                stored_by_fingerprint[(candidate.proposed_layer, fingerprint)] = stored_id
                 await connection.execute(
                     text(
                         """
@@ -440,39 +568,46 @@ class PostgresRepository:
                         "outcome": candidate_decision.outcome,
                         "reason": candidate_decision.reason,
                         "policy_version": policy_version,
-                        "stored_memory_id": stored_by_fingerprint.get(fingerprint),
+                        "stored_memory_id": (
+                            None if candidate_decision.outcome == "rejected"
+                            else stored_by_fingerprint.get((candidate.proposed_layer, fingerprint))
+                        ),
                         **scope.model_dump(),
                     },
                 )
         return stored
 
-    async def complete_extraction(self, job_id: int) -> None:
+    async def complete_extraction(self, job_id: int, attempts: int) -> None:
         async with self.engine.begin() as connection:
             await connection.execute(
                 text(
                     """
                     UPDATE memory_outbox
                     SET status='completed', completed_at=now(), locked_at=NULL, error_code=NULL
-                    WHERE id=:id AND status='processing'
+                    WHERE id=:id AND status='processing' AND attempts=:attempts
                     """
                 ),
-                {"id": job_id},
+                {"id": job_id, "attempts": attempts},
             )
 
-    async def fail_extraction(self, job_id: int, error_code: str) -> None:
+    async def fail_extraction(
+        self, job_id: int, attempts: int, error_code: str, *, terminal: bool = False
+    ) -> None:
         async with self.engine.begin() as connection:
             await connection.execute(
                 text(
                     """
                     UPDATE memory_outbox
-                    SET status=CASE WHEN attempts >= 5 THEN 'failed' ELSE 'retry' END,
+                    SET status=CASE WHEN :terminal OR attempts >= 5 THEN 'failed' ELSE 'retry' END,
                         available_at=now() + make_interval(secs => LEAST(300, attempts * attempts)),
                         locked_at=NULL,
+                        completed_at=CASE WHEN :terminal OR attempts >= 5 THEN now() ELSE NULL END,
                         error_code=:error_code
-                    WHERE id=:id AND status='processing'
+                    WHERE id=:id AND status='processing' AND attempts=:attempts
                     """
                 ),
-                {"id": job_id, "error_code": error_code[:120]},
+                {"id": job_id, "attempts": attempts,
+                 "error_code": error_code[:120], "terminal": terminal},
             )
 
     async def execute_command_idempotent(
@@ -677,7 +812,7 @@ class PostgresRepository:
         event = await connection.execute(
             text(
                 """
-                SELECT source, content FROM memory_event
+                SELECT source, content, ciphertext FROM memory_event
                 WHERE id=:event_id AND tenant_id=:tenant_id AND user_id=:user_id
                   AND agent_id=:agent_id AND prohibited_from_memory=false
                   AND (:require_user_source=false OR source='user')
@@ -690,8 +825,9 @@ class PostgresRepository:
                 **scope.model_dump(),
             },
         )
-        evidence = event.first()
-        if evidence is None or is_memory_opt_out(evidence.source, evidence.content):
+        row = event.mappings().first()
+        evidence = self._event_payload(source_event_id, row) if row is not None else None
+        if evidence is None or is_memory_opt_out(evidence["source"], evidence["content"]):
             raise NotFoundError(source_event_id)
         result = await connection.execute(
             text(
@@ -705,7 +841,7 @@ class PostgresRepository:
                     :kind, 'active', 1.0, :policy_version, now(), :fingerprint,
                     'high', 'stable'
                 )
-                ON CONFLICT (tenant_id, user_id, agent_id, fingerprint)
+                ON CONFLICT (tenant_id, user_id, agent_id, layer, fingerprint)
                 WHERE fingerprint IS NOT NULL
                 DO UPDATE SET
                     status=CASE
@@ -717,6 +853,7 @@ class PostgresRepository:
                         ELSE memory_item.confidence
                     END,
                     updated_at=now()
+                WHERE memory_item.status <> 'deleting'
                 RETURNING id
                 """
             ),
@@ -730,7 +867,10 @@ class PostgresRepository:
                 **scope.model_dump(),
             },
         )
-        stored_id = str(result.scalar_one())
+        stored = result.scalar_one_or_none()
+        if stored is None:
+            raise MemoryDeletionInProgress()
+        stored_id = str(stored)
         await self._add_evidence(connection, stored_id, source_event_id)
         await self._audit(connection, scope, audit_action, stored_id)
         return stored_id
@@ -789,7 +929,7 @@ class PostgresRepository:
         event = await connection.execute(
             text(
                 """
-                SELECT source, content FROM memory_event
+                SELECT source, content, ciphertext FROM memory_event
                 WHERE id=:event_id AND tenant_id=:tenant_id AND user_id=:user_id
                   AND agent_id=:agent_id AND prohibited_from_memory=false
                   AND (:procedural=false OR source='user')
@@ -798,11 +938,12 @@ class PostgresRepository:
             params,
         )
         owned_row = owned.mappings().first()
-        evidence = event.first()
+        row = event.mappings().first()
+        evidence = self._event_payload(source_event_id, row) if row is not None else None
         if (
             owned_row is None
             or evidence is None
-            or is_memory_opt_out(evidence.source, evidence.content)
+            or is_memory_opt_out(evidence["source"], evidence["content"])
         ):
             raise NotFoundError(memory_id)
         layer = owned_row["layer"]
@@ -915,7 +1056,7 @@ class PostgresRepository:
     ) -> tuple[list[str], str | None]:
         normalized = sorted(set(memory_ids))
         await self._lock_deletion_target(connection, scope, "memory", normalized)
-        existing = await self._find_active_deletion_job(
+        existing = await self._find_or_retry_deletion_job(
             connection, scope, "memory_ids", normalized
         )
         if existing is not None:
@@ -966,7 +1107,7 @@ class PostgresRepository:
     ) -> tuple[list[str], str | None]:
         normalized = sorted(set(event_ids))
         await self._lock_deletion_target(connection, scope, "event", normalized)
-        existing = await self._find_active_deletion_job(
+        existing = await self._find_or_retry_deletion_job(
             connection, scope, "event_ids", normalized
         )
         if existing is not None:
@@ -1042,6 +1183,9 @@ class PostgresRepository:
         purpose: str,
         now: datetime,
         limit: int = 100,
+        *,
+        embedding_model: str | None = None,
+        query_embedding: list[float] | None = None,
     ) -> list[MemoryContextItem]:
         async with self.engine.connect() as connection:
             await self._set_scope(connection, scope)
@@ -1119,10 +1263,32 @@ class PostgresRepository:
                         ORDER BY updated_at DESC, id
                         LIMIT 20
                     ),
+                    semantic_scores AS (
+                        SELECT m.id, similarity.score
+                        FROM eligible m
+                        JOIN memory_embedding e ON e.memory_id=m.id
+                        CROSS JOIN LATERAL (
+                            SELECT sum(a::double precision * b)
+                                / NULLIF(sqrt(sum(a::double precision * a)
+                                              * sum(b::double precision * b)), 0) AS score
+                            FROM unnest(e.embedding, CAST(:query_embedding AS real[])) AS pairs(a,b)
+                        ) similarity
+                        WHERE e.model=:embedding_model AND e.dimensions=:embedding_dimensions
+                          AND m.status='active' AND m.sensitivity IN ('low','medium')
+                          AND cardinality(m.poisoning_flags)=0
+                    ),
+                    semantic AS (
+                        SELECT id, row_number() OVER (ORDER BY score DESC, id) AS position
+                        FROM semantic_scores
+                        WHERE score BETWEEN 0.5 AND 1.000001
+                        ORDER BY score DESC, id LIMIT 40
+                    ),
                     ranked AS (
                         SELECT id, 1.0 / (60 + position) AS score, true AS query_matched FROM lexical
                         UNION ALL
                         SELECT id, 1.0 / (60 + position), true FROM exact_subject
+                        UNION ALL
+                        SELECT id, 1.0 / (60 + position), true FROM semantic
                         UNION ALL
                         SELECT id, 1.0 / (60 + position), false FROM recent_episode
                         UNION ALL
@@ -1137,7 +1303,12 @@ class PostgresRepository:
                            COALESCE(array_agg(e.event_id::text)
                              FILTER (WHERE e.event_id IS NOT NULL), '{}') AS event_ids,
                            COALESCE(c.conflict_ids, '{}') AS conflict_ids,
-                           f.query_matched, f.rrf_score
+                           f.query_matched,
+                           (m.sensitivity='low' AND cardinality(m.poisoning_flags)=0
+                            AND m.layer IN ('L2','L3')
+                            AND m.subject_key IS DISTINCT FROM :query
+                            AND cardinality(COALESCE(c.conflict_ids, '{}'))=0) AS rerank_eligible,
+                           f.rrf_score
                            + CASE m.future_utility
                                WHEN 'high' THEN 0.20
                                WHEN 'medium' THEN 0.08
@@ -1184,6 +1355,9 @@ class PostgresRepository:
                 {
                     **scope.model_dump(),
                     "query": query,
+                    "embedding_model": embedding_model,
+                    "query_embedding": query_embedding or [],
+                    "embedding_dimensions": len(query_embedding or []),
                     "purpose": purpose,
                     "now": now,
                     "limit": limit,
@@ -1263,6 +1437,7 @@ class PostgresRepository:
             "m.tenant_id=:tenant_id",
             "m.user_id=:user_id",
             "m.agent_id=:agent_id",
+            "m.status <> 'deleting'",
             "m.status = ANY(CAST(:statuses AS text[]))",
         ]
         params: dict[str, Any] = {
@@ -1399,8 +1574,18 @@ class PostgresRepository:
                                 ELSE poisoning_flags END AS poisoning_flags,
                            outcome, reason,
                            policy_version, stored_memory_id, created_at
-                    FROM memory_candidate_decision
+                    FROM memory_candidate_decision d
                     WHERE tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
+                      AND EXISTS (
+                        SELECT 1 FROM memory_event e
+                        WHERE e.id=d.event_id AND NOT e.prohibited_from_memory
+                      )
+                      AND (
+                        d.stored_memory_id IS NULL OR EXISTS (
+                          SELECT 1 FROM memory_item m
+                          WHERE m.id=d.stored_memory_id AND m.status<>'deleting'
+                        )
+                      )
                     ORDER BY created_at DESC, id DESC
                     LIMIT :limit
                     """
@@ -1560,7 +1745,7 @@ class PostgresRepository:
                     """
                     WITH picked AS (
                         SELECT id FROM deletion_job
-                        WHERE (
+                        WHERE attempts < 5 AND (
                             (status IN ('pending','retry') AND available_at <= now())
                             OR (status='processing' AND locked_at < now() - interval '5 minutes')
                         )
@@ -1570,7 +1755,7 @@ class PostgresRepository:
                     UPDATE deletion_job d
                     SET status='processing', locked_at=now(), attempts=d.attempts + 1
                     FROM picked WHERE d.id=picked.id
-                    RETURNING d.id, d.memory_ids, d.event_ids
+                    RETURNING d.id, d.memory_ids, d.event_ids, d.attempts
                     """
                 )
             )
@@ -1578,14 +1763,22 @@ class PostgresRepository:
         if not row:
             return False
         try:
-            await self._apply_deletion(row)
+            return await self._apply_deletion(row)
         except Exception as exc:
-            await self._fail_deletion(str(row["id"]), type(exc).__name__)
+            await self._fail_deletion(str(row["id"]), row["attempts"], type(exc).__name__)
             raise
-        return True
 
-    async def _apply_deletion(self, row: Any) -> None:
+    async def _apply_deletion(self, row: Any) -> bool:
         async with self.engine.begin() as connection:
+            lease = await connection.execute(
+                text(
+                    "SELECT id FROM deletion_job WHERE id=:id "
+                    "AND status='processing' AND attempts=:attempts FOR UPDATE"
+                ),
+                {"id": row["id"], "attempts": row["attempts"]},
+            )
+            if lease.first() is None:
+                return False
             await connection.execute(
                 text(
                     """
@@ -1610,6 +1803,7 @@ class PostgresRepository:
                     """
                     UPDATE memory_event
                     SET content='[deleted-by-user]', metadata='{}'::jsonb,
+                        ciphertext=NULL, ciphertext_key_id=NULL, ciphertext_retry_at=NULL,
                         prohibited_from_memory=true, redacted_at=now()
                     WHERE id = ANY(CAST(:ids AS uuid[]))
                     """
@@ -1625,6 +1819,18 @@ class PostgresRepository:
                         WHERE id = ANY(CAST(:memory_ids AS uuid[]))
                       )
                       OR EXISTS (
+                        SELECT 1 FROM memory_embedding
+                        WHERE memory_id = ANY(CAST(:memory_ids AS uuid[]))
+                      )
+                      OR EXISTS (
+                        SELECT 1 FROM memory_evidence
+                        WHERE memory_id = ANY(CAST(:memory_ids AS uuid[]))
+                      )
+                      OR EXISTS (
+                        SELECT 1 FROM memory_recall_diagnostic
+                        WHERE selected_memory_ids && CAST(:memory_ids AS uuid[])
+                      )
+                      OR EXISTS (
                         SELECT 1 FROM memory_candidate_decision
                         WHERE event_id = ANY(CAST(:event_ids AS uuid[]))
                            OR stored_memory_id = ANY(CAST(:memory_ids AS uuid[]))
@@ -1635,6 +1841,7 @@ class PostgresRepository:
                           AND (
                             content <> '[deleted-by-user]'
                             OR metadata <> '{}'::jsonb
+                            OR ciphertext IS NOT NULL
                             OR prohibited_from_memory=false
                             OR redacted_at IS NULL
                           )
@@ -1647,19 +1854,20 @@ class PostgresRepository:
                 },
             )
             if canary.scalar_one():
-                raise RuntimeError("deletion_canary_failed")
+                raise DeletionCanaryFailed("deletion_canary_failed")
             await connection.execute(
                 text(
                     """
                     UPDATE deletion_job
                     SET status='completed', completed_at=now(), locked_at=NULL, error_code=NULL
-                    WHERE id=:id AND status='processing'
+                    WHERE id=:id AND status='processing' AND attempts=:attempts
                     """
                 ),
-                {"id": row["id"]},
+                {"id": row["id"], "attempts": row["attempts"]},
             )
+            return True
 
-    async def _fail_deletion(self, job_id: str, error_code: str) -> None:
+    async def _fail_deletion(self, job_id: str, attempts: int, error_code: str) -> None:
         async with self.engine.begin() as connection:
             await connection.execute(
                 text(
@@ -1669,10 +1877,10 @@ class PostgresRepository:
                         available_at=now() + make_interval(secs => LEAST(300, attempts * attempts)),
                         locked_at=NULL, error_code=:error_code,
                         completed_at=CASE WHEN attempts >= 5 THEN now() ELSE NULL END
-                    WHERE id=:id AND status='processing'
+                    WHERE id=:id AND status='processing' AND attempts=:attempts
                     """
                 ),
-                {"id": job_id, "error_code": error_code[:120]},
+                {"id": job_id, "attempts": attempts, "error_code": error_code[:120]},
             )
 
     async def run_maintenance(self, raw_event_retention_days: int) -> None:
@@ -1685,6 +1893,18 @@ class PostgresRepository:
             )
             if not leader.scalar_one():
                 return
+            for table in ("memory_outbox", "deletion_job"):
+                await connection.execute(
+                    text(
+                        f"""
+                        UPDATE {table}
+                        SET status='failed', locked_at=NULL, completed_at=now(),
+                            error_code='lease_exhausted'
+                        WHERE status='processing' AND attempts >= 5
+                          AND locked_at < now() - interval '5 minutes'
+                        """
+                    )
+                )
             await connection.execute(
                 text(
                     """
@@ -1699,7 +1919,9 @@ class PostgresRepository:
                 text(
                     """
                     UPDATE memory_event e
-                    SET content='[retention-expired]', metadata='{}'::jsonb, redacted_at=now()
+                    SET content='[retention-expired]', metadata='{}'::jsonb,
+                        ciphertext=NULL, ciphertext_key_id=NULL, ciphertext_retry_at=NULL,
+                        redacted_at=now()
                     WHERE e.redacted_at IS NULL
                       AND e.recorded_at < now() - make_interval(days => :retention_days)
                       AND NOT EXISTS (
@@ -1736,6 +1958,59 @@ class PostgresRepository:
                     """
                 )
             )
+            if self.event_cipher is not None:
+                await self._backfill_event_ciphertext(connection, self.event_cipher)
+
+    async def _backfill_event_ciphertext(
+        self, connection: AsyncConnection, cipher: EventCipher
+    ) -> None:
+        eligibility = (
+            "ciphertext_key_id IS DISTINCT FROM :key_id"
+            if self.rotate_event_ciphertext else "ciphertext IS NULL"
+        )
+        events = await connection.execute(
+            text(
+                f"""
+                SELECT id, content, metadata, ciphertext FROM memory_event
+                WHERE {eligibility} AND redacted_at IS NULL
+                  AND (ciphertext_retry_at IS NULL OR ciphertext_retry_at <= now())
+                ORDER BY recorded_at, id
+                FOR UPDATE SKIP LOCKED LIMIT 32
+                """
+            ),
+            {"key_id": cipher.key_id},
+        )
+        encrypted = []
+        failed_ids = []
+        for event in events.mappings():
+            try:
+                payload = self._event_payload(str(event["id"]), event)
+            except (InvalidTag, ValueError):
+                failed_ids.append(event["id"])
+                continue
+            encrypted.append({
+                "id": event["id"],
+                "ciphertext": cipher.encrypt(str(event["id"]), payload["content"], payload["metadata"]),
+                "key_id": cipher.key_id,
+            })
+        if encrypted:
+            await connection.execute(
+                text(
+                    "UPDATE memory_event SET content='', metadata='{}'::jsonb, "
+                    "ciphertext=:ciphertext, ciphertext_key_id=:key_id, "
+                    "ciphertext_retry_at=NULL WHERE id=:id"
+                ),
+                encrypted,
+            )
+        if failed_ids:
+            await connection.execute(
+                text(
+                    "UPDATE memory_event SET ciphertext_retry_at=now() + interval '1 hour' "
+                    "WHERE id=ANY(CAST(:ids AS uuid[]))"
+                ),
+                {"ids": failed_ids},
+            )
+            structlog.get_logger().warning("memory_event_rotation_deferred", count=len(failed_ids))
 
     @staticmethod
     async def _consume_write_quota(
@@ -1808,8 +2083,8 @@ class PostgresRepository:
             {"id": str(uuid4()), "action": action, "target_id": target_id, **scope.model_dump()},
         )
 
-    @staticmethod
-    async def _find_active_deletion_job(
+    async def _find_or_retry_deletion_job(
+        self,
         connection: AsyncConnection,
         scope: MemoryScope,
         target_column: str,
@@ -1820,17 +2095,26 @@ class PostgresRepository:
         result = await connection.execute(
             text(
                 f"""
-                SELECT id, memory_ids, event_ids FROM deletion_job
+                SELECT id, memory_ids, event_ids, status FROM deletion_job
                 WHERE tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
-                  AND status IN ('pending','processing','retry')
                   AND {target_column} @> CAST(:ids AS uuid[])
                   AND {target_column} <@ CAST(:ids AS uuid[])
-                ORDER BY created_at DESC LIMIT 1
+                  AND (:by_event OR cardinality(event_ids)=0)
+                ORDER BY created_at DESC, id DESC LIMIT 1
                 """
             ),
-            {**scope.model_dump(), "ids": target_ids},
+            {**scope.model_dump(), "ids": target_ids, "by_event": target_column == "event_ids"},
         )
-        return result.mappings().first()
+        row = result.mappings().first()
+        if row is None or row["status"] == "completed":
+            return None
+        if row["status"] != "failed":
+            return row
+        memory_ids = [str(value) for value in row["memory_ids"]]
+        event_ids = [str(value) for value in row["event_ids"]]
+        job_id = await self._create_deletion_job(connection, scope, memory_ids, event_ids)
+        await self._audit(connection, scope, "retry_deletion", job_id)
+        return {"id": job_id, "memory_ids": memory_ids}
 
     @staticmethod
     async def _lock_deletion_target(
@@ -1889,6 +2173,7 @@ class PostgresRepository:
             source_event_ids=list(row["event_ids"]),
             conflict_memory_ids=list(row["conflict_ids"]),
             query_matched=row.get("query_matched", False),
+            rerank_eligible=row.get("rerank_eligible", False),
         )
 
     @staticmethod

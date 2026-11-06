@@ -1,8 +1,8 @@
 {"id":"explicit-preference","content":"请记住：我喜欢简洁回答","expected_layers":["L3"]}
 {"id":"opt-out-with-emotion-and-event","content":"请不要记住：我非常焦虑，明天下午要参加项目面试","expected_layers":[]}
 {"id":"explicit-negative-preference","content":"请记住：我不喜欢冗长的回答","expected_layers":["L3"]}
-{"id":"bounded-meeting","content":"提醒我下周一上午十点参加项目会议","expected_layers":["L2"]}
-{"id":"temporary-distress","content":"我今天特别难过，压力非常大","expected_layers":["L1"]}
+{"id":"bounded-meeting","content":"提醒我下周一上午十点参加项目会议","expected_layers":["L2"],"required_fragments":{"L2":["项目会议"]}}
+{"id":"temporary-distress","content":"我今天特别难过，压力非常大","expected_layers":["L1"],"max_ttl_hours":{"L1":72}}
 {"id":"emotion-and-commitment","content":"我非常焦虑，提醒我明天下午参加项目面试","expected_layers":["L1","L2"]}
 {"id":"ordinary-fact-without-consent","content":"我住在北京","expected_layers":[]}
 {"id":"ordinary-positive-emotion","content":"我今天很开心","expected_layers":[]}

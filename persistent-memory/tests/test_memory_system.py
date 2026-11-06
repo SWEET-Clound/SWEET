@@ -1,6 +1,9 @@
+import json
 from datetime import UTC, datetime
 
+import httpx
 import pytest
+from prometheus_client import REGISTRY
 
 from memory_system.models import (
     MemoryContextItem,
@@ -11,6 +14,7 @@ from memory_system.models import (
     RememberProcedureCommand,
 )
 from memory_system.policy import MemoryPolicy
+from memory_system.rerank import RerankClient
 from memory_system.retrieval import pack_context
 from memory_system.system import MemoryPolicyRejected, MemorySystem
 
@@ -65,6 +69,9 @@ async def test_build_context_respects_budget_and_marks_memory_as_untrusted_data(
         ]
     )
     system = MemorySystem(repository, MemoryPolicy(), max_context_tokens=2048)
+    metric_name = "memory_recall_outcomes_total"
+    labels = {"purpose": "conversation", "outcome": "context_only"}
+    before = REGISTRY.get_sample_value(metric_name, labels) or 0
 
     result = await system.build_context(
         RecallRequest(
@@ -89,6 +96,7 @@ async def test_build_context_respects_budget_and_marks_memory_as_untrusted_data(
     assert diagnostic[1] == result.diagnostics_id
     assert diagnostic[4] == 2
     assert diagnostic[5] == ["00000000-0000-0000-0000-000000000001"]
+    assert REGISTRY.get_sample_value(metric_name, labels) == before + 1
 
 
 @pytest.mark.asyncio
@@ -135,6 +143,48 @@ async def test_query_match_is_packed_before_core_profile_without_duplicates(budg
         expected.append(profile.memory_id)
     assert [item.memory_id for item in result.items] == expected
     assert result.truncated is (budget == 100)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("indexes", "expected"), [([1, 0], [3, 2, 1]), ([1, 1], [1, 2, 3])])
+async def test_reranking_only_reorders_eligible_slots(indexes, expected) -> None:
+    candidates = [
+        MemoryContextItem(
+            memory_id=f"00000000-0000-0000-0000-{i:012d}",
+            statement=f"事项 {i}",
+            layer=MemoryLayer.EPISODIC,
+            valid_from=None,
+            valid_to=None,
+            confidence=1,
+            source_event_ids=[],
+            query_matched=True,
+            rerank_eligible=i != 2,
+        )
+        for i in (1, 2, 3)
+    ]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/rerank"
+        assert json.loads(request.content) == {
+            "model": "test-ranker", "query": "事项", "documents": ["事项 1", "事项 3"],
+        }
+        return httpx.Response(200, json={"results": [{"index": i} for i in indexes]})
+
+    transport = httpx.MockTransport(handle)
+    async with httpx.AsyncClient(base_url="http://test/v1/", transport=transport) as http:
+        system = MemorySystem(
+            StubRepository(candidates), MemoryPolicy(), 2048,
+            rerank_client=RerankClient(http, "test-ranker"),
+        )
+        result = await system.build_context(
+            RecallRequest(
+                tenant_id="tenant-a", user_id="user-a", agent_id="agent-a",
+                thread_id="thread-a", query="事项", purpose="conversation",
+                token_budget=512, now=datetime.now(UTC),
+            )
+        )
+
+    assert [item.statement for item in result.items] == [f"事项 {i}" for i in expected]
 
 
 def test_oversized_candidate_does_not_starve_smaller_memories() -> None:

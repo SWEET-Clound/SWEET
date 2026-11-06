@@ -11,11 +11,13 @@ from uuid import UUID, uuid4
 import jwt
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import PyJWKClient
 from jwt.exceptions import PyJWKClientConnectionError
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
+from pydantic import AwareDatetime
 from sqlalchemy.exc import SQLAlchemyError
 
 from memory_system.models import (
@@ -50,6 +52,7 @@ from memory_system.models import (
 )
 from memory_system.postgres import (
     IdempotencyConflictError,
+    MemoryDeletionInProgress,
     NotFoundError,
     RateLimitExceeded,
 )
@@ -164,9 +167,25 @@ def create_app(
             response.headers["X-Memory-Diagnostics-Id"] = str(uuid4())
         return response
 
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(_: Request, exc: RequestValidationError) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": [
+                    {"loc": error["loc"], "type": error["type"]}
+                    for error in exc.errors()
+                ]
+            },
+        )
+
     @app.exception_handler(IdempotencyConflictError)
     async def idempotency_conflict(_: Request, __: IdempotencyConflictError) -> JSONResponse:
         return JSONResponse(status_code=409, content={"code": "idempotency_conflict"})
+
+    @app.exception_handler(MemoryDeletionInProgress)
+    async def memory_deletion_in_progress(_: Request, __: MemoryDeletionInProgress) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"code": "memory_deletion_in_progress"})
 
     @app.exception_handler(NotFoundError)
     async def hidden_not_found(_: Request, __: NotFoundError) -> JSONResponse:
@@ -230,7 +249,7 @@ def create_app(
             Literal["conversation", "task", "history", "support"], Query()
         ] = "conversation",
         token_budget: Annotated[int, Query(ge=0, le=512)] = 512,
-        request_time: datetime | None = None,
+        request_time: AwareDatetime | None = None,
     ):
         if purpose not in identity.allowed_purposes:
             raise HTTPException(status_code=403, detail="purpose_not_allowed")
@@ -297,6 +316,10 @@ def create_app(
         cursor: UUID | None = None,
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
     ):
+        if {"quarantined", "rejected"}.intersection(statuses or ()) and (
+            "review" not in identity.allowed_purposes
+        ):
+            raise HTTPException(status_code=403, detail="purpose_not_allowed")
         page = list(
             await system.list_memories(
                 MemoryListQuery(

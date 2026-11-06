@@ -5,7 +5,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, BaseModel, Field
+from pydantic import AfterValidator, AwareDatetime, BaseModel, Field
 
 
 def _bounded_metadata(value: dict[str, Any]) -> dict[str, Any]:
@@ -61,7 +61,7 @@ class InteractionEvent(BaseModel):
     idempotency_key: str
     source: EventSource
     content: str = Field(min_length=1, max_length=100_000)
-    occurred_at: datetime
+    occurred_at: AwareDatetime
     metadata: BoundedMetadata = Field(default_factory=dict)
     allow_memory_extraction: bool = False
 
@@ -74,7 +74,7 @@ class RecallRequest(BaseModel):
     query: str = Field(min_length=1, max_length=10_000)
     purpose: Literal["conversation", "task", "history", "support"]
     token_budget: int = Field(ge=0, le=4096)
-    now: datetime
+    now: AwareDatetime
 
 
 class MemoryContextItem(BaseModel):
@@ -87,6 +87,7 @@ class MemoryContextItem(BaseModel):
     source_event_ids: list[str]
     conflict_memory_ids: list[str] = Field(default_factory=list)
     query_matched: bool = Field(default=False, exclude=True)
+    rerank_eligible: bool = Field(default=False, exclude=True)
 
 
 class MemoryContext(BaseModel):
@@ -167,27 +168,27 @@ class MemorySummary(BaseModel):
 class AffectSignal(BaseModel):
     valence: float = Field(ge=-1, le=1)
     arousal: float = Field(ge=0, le=1)
-    labels: list[str]
+    labels: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(max_length=8)
     confidence: float = Field(ge=0, le=1)
-    observed_at: datetime
+    observed_at: AwareDatetime
     derived_from: Literal["text", "voice", "multimodal"]
 
 
 class MemoryCandidate(BaseModel):
     statement: str = Field(min_length=1, max_length=10_000)
     proposed_layer: MemoryLayer
-    kind: str
-    subject_key: str | None
-    valid_from: datetime | None
-    valid_to: datetime | None
-    expires_at: datetime | None = None
-    source_event_ids: list[str]
+    kind: str = Field(min_length=1, max_length=64)
+    subject_key: Annotated[str, Field(min_length=1, max_length=256)] | None
+    valid_from: AwareDatetime | None
+    valid_to: AwareDatetime | None
+    expires_at: AwareDatetime | None = None
+    source_event_ids: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(max_length=16)
     confidence: float = Field(ge=0, le=1)
     future_utility: Literal["low", "medium", "high"]
     durability: Literal["transient", "uncertain", "stable"]
     affect: AffectSignal | None
     sensitivity: Literal["low", "medium", "high", "secret"]
-    poisoning_flags: list[str]
+    poisoning_flags: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(max_length=8)
 
 
 class CandidateDecision(BaseModel):
@@ -269,7 +270,7 @@ class EventRequest(BaseModel):
     thread_id: str = Field(min_length=1, max_length=128)
     source: EventSource
     content: str = Field(min_length=1, max_length=100_000)
-    occurred_at: datetime
+    occurred_at: AwareDatetime
     metadata: BoundedMetadata = Field(default_factory=dict)
 
     def to_domain(self, identity: Identity, idempotency_key: str) -> InteractionEvent:
@@ -290,7 +291,7 @@ class RecallRequestBody(BaseModel):
     query: str = Field(min_length=1, max_length=10_000)
     purpose: Literal["conversation", "task", "history", "support"]
     token_budget: int = Field(ge=0, le=4096)
-    request_time: datetime
+    request_time: AwareDatetime
 
 
 class RememberRequest(BaseModel):

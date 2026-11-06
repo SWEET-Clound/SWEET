@@ -1,10 +1,12 @@
 import re
 from dataclasses import dataclass
+from datetime import timedelta
 
 from memory_system.models import EventSource, InteractionEvent, MemoryCandidate, MemoryLayer
 
 _OPT_OUT = re.compile(r"^\s*(?:请|麻烦)?\s*(?:你)?\s*(?:不要|别)\s*(?:记住|记录|保存)")
 REMEMBER_PREFIX = re.compile(r"^\s*(?:请|麻烦)?\s*(?:你)?\s*记住\s*[：:]?\s*(?P<fact>\S.*)$")
+EPISODIC_TTL = timedelta(days=180)
 
 
 def explicitly_opts_out(event: InteractionEvent) -> bool:
@@ -37,7 +39,10 @@ class WriteDecision:
 
 
 class MemoryPolicy:
-    version = "2026-10-first-release-v1"
+    version = "2026-11-candidate-metadata-v6"
+
+    def __init__(self, working_memory_ttl_hours: int = 72) -> None:
+        self.working_memory_ttl = timedelta(hours=working_memory_ttl_hours)
 
     def evaluate_explicit_memory(self, statement: str) -> WriteDecision:
         if any(pattern.search(statement) for pattern in _SECRET_PATTERNS):
@@ -55,21 +60,49 @@ class MemoryPolicy:
             return WriteDecision(False, "poisoning_signal")
         if candidate.sensitivity in {"high", "secret"}:
             return WriteDecision(False, "sensitive_content_requires_explicit_consent")
-        content_decision = self.evaluate_explicit_memory(candidate.statement)
-        if not content_decision.allowed:
-            return content_decision
+        text_fields = [candidate.statement, candidate.kind, candidate.subject_key or ""]
+        if candidate.affect is not None:
+            text_fields.extend(candidate.affect.labels)
+        for value in text_fields:
+            content_decision = self.evaluate_explicit_memory(value)
+            if not content_decision.allowed:
+                return content_decision
+        if candidate.valid_from is not None and any(
+            end is not None and end <= candidate.valid_from
+            for end in (candidate.valid_to, candidate.expires_at)
+        ):
+            return WriteDecision(False, "memory_validity_window_is_empty")
         if candidate.proposed_layer is MemoryLayer.WORKING and candidate.expires_at is None:
             return WriteDecision(False, "working_memory_requires_expiry")
         if candidate.proposed_layer is MemoryLayer.EPISODIC and candidate.expires_at is None:
             return WriteDecision(False, "episodic_memory_requires_expiry")
+        if event is not None and candidate.proposed_layer in {
+            MemoryLayer.WORKING, MemoryLayer.EPISODIC
+        }:
+            working = candidate.proposed_layer is MemoryLayer.WORKING
+            ttl = self.working_memory_ttl if working else EPISODIC_TTL
+            expiry = candidate.expires_at
+            if expiry is not None and (
+                expiry.utcoffset() is None
+                or not event.occurred_at < expiry <= event.occurred_at + ttl
+            ):
+                reason = (
+                    "working_memory_expiry_outside_policy_window"
+                    if working else "episodic_memory_expiry_outside_policy_window"
+                )
+                return WriteDecision(False, reason)
         if candidate.proposed_layer is MemoryLayer.SEMANTIC and (
             candidate.durability != "stable" or candidate.confidence < 0.85
         ):
             return WriteDecision(False, "semantic_memory_requires_stable_evidence")
-        if candidate.proposed_layer is MemoryLayer.SEMANTIC and (
-            event is None or not REMEMBER_PREFIX.match(event.content)
-        ):
-            return WriteDecision(False, "semantic_memory_requires_explicit_consent")
+        if candidate.proposed_layer is MemoryLayer.SEMANTIC:
+            explicit = REMEMBER_PREFIX.match(event.content) if event is not None else None
+            if explicit is None:
+                return WriteDecision(False, "semantic_memory_requires_explicit_consent")
+            fact = " ".join(explicit["fact"].split())
+            statement = " ".join(candidate.statement.split())
+            if statement != fact:
+                return WriteDecision(False, "semantic_memory_requires_verbatim_evidence")
         if candidate.proposed_layer is MemoryLayer.PROCEDURAL:
             return WriteDecision(False, "procedural_memory_requires_verified_outcomes")
         return WriteDecision(True)

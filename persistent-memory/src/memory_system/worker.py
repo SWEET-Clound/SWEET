@@ -1,12 +1,15 @@
 import asyncio
 import signal
+from collections.abc import Awaitable, Callable
+from functools import partial
 
 import structlog
 from prometheus_client import Counter
 
 from memory_system.consolidation import Consolidator, HeuristicExtractor, HybridExtractor
 from memory_system.dev import check_worker_database
-from memory_system.llm import OpenAICompatibleExtractor
+from memory_system.embedding import EmbeddingClient, build_embedding_client
+from memory_system.llm import ModelResponseTooLarge, OpenAICompatibleExtractor
 from memory_system.policy import MemoryPolicy
 from memory_system.postgres import PostgresRepository
 from memory_system.runtime import configure_event_loop
@@ -28,10 +31,13 @@ async def process_one_extraction(
     try:
         await consolidator.process(repository, job)
     except Exception as exc:  # noqa: BLE001 - persist job failure and keep the worker alive
-        await repository.fail_extraction(job.job_id, type(exc).__name__)
+        await repository.fail_extraction(
+            job.job_id, job.attempts, type(exc).__name__,
+            terminal=isinstance(exc, ModelResponseTooLarge),
+        )
         _WORKER_JOBS.labels(kind="extraction", result="failed").inc()
         return True
-    await repository.complete_extraction(job.job_id)
+    await repository.complete_extraction(job.job_id, job.attempts)
     _WORKER_JOBS.labels(kind="extraction", result="completed").inc()
     return True
 
@@ -50,15 +56,14 @@ async def process_one_deletion(repository: PostgresRepository) -> bool:
         return False
 
 
-async def process_worker_iteration(
+async def process_extraction_iteration(
     repository: PostgresRepository, consolidator: Consolidator
 ) -> bool:
     try:
-        worked = await process_one_extraction(repository, consolidator)
-        return await process_one_deletion(repository) or worked
+        return await process_one_extraction(repository, consolidator)
     except Exception as exc:  # noqa: BLE001 - a database outage must not kill the worker
         structlog.get_logger().error(
-            "memory_worker_iteration_failed", error_code=type(exc).__name__
+            "memory_extraction_iteration_failed", error_code=type(exc).__name__
         )
         return False
 
@@ -84,13 +89,12 @@ def build_extractor(settings: Settings):
 
 
 async def worker_loop(
-    repository: PostgresRepository,
-    consolidator: Consolidator,
+    process_one: Callable[[], Awaitable[bool]],
     poll_seconds: float,
     stop_event: asyncio.Event,
 ) -> None:
     while not stop_event.is_set():
-        worked = await process_worker_iteration(repository, consolidator)
+        worked = await process_one()
         if not worked:
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=poll_seconds)
@@ -98,10 +102,23 @@ async def worker_loop(
                 pass
 
 
+async def backfill_embeddings(repository: PostgresRepository, client: EmbeddingClient) -> None:
+    async with repository.embedding_backfill_lock(client.model, client.dimensions) as acquired:
+        if not acquired:
+            return
+        items = await repository.pending_embeddings(client.model, client.dimensions)
+        if not items:
+            return
+        vectors = await asyncio.to_thread(client.embed, [statement for _, statement in items])
+        for (memory_id, statement), vector in zip(items, vectors, strict=True):
+            await repository.store_embedding(memory_id, statement, client.model, vector)
+
+
 async def maintenance_loop(
     repository: PostgresRepository,
     raw_event_retention_days: int,
     stop_event: asyncio.Event,
+    embedding_client: EmbeddingClient | None = None,
 ) -> None:
     log = structlog.get_logger()
     while not stop_event.is_set():
@@ -109,6 +126,11 @@ async def maintenance_loop(
             await repository.run_maintenance(raw_event_retention_days)
         except Exception as exc:  # noqa: BLE001 - maintenance must not stop job processing
             log.error("memory_maintenance_failed", error_code=type(exc).__name__)
+        if embedding_client is not None and not stop_event.is_set():
+            try:
+                await backfill_embeddings(repository, embedding_client)
+            except Exception as exc:  # noqa: BLE001 - lexical recall remains available
+                log.error("memory_embedding_backfill_failed", error_code=type(exc).__name__)
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=60)
         except TimeoutError:
@@ -119,25 +141,36 @@ async def run_worker(stop_event: asyncio.Event | None = None) -> None:
     settings = Settings()  # type: ignore[call-arg]
     if settings.worker_database_url is None:
         raise ValueError("MEMORY_WORKER_DATABASE_URL is required for memory-worker")
+    event_cipher = settings.build_event_cipher()
     database_url = settings.worker_database_url.get_secret_value()
     await asyncio.to_thread(check_worker_database, database_url)
-    repository = PostgresRepository.from_url(database_url)
+    repository = PostgresRepository.from_url(
+        database_url,
+        event_cipher=event_cipher,
+        rotate_event_ciphertext=settings.event_encryption_rotate,
+    )
     consolidator = Consolidator(
         build_extractor(settings),
-        MemoryPolicy(),
+        MemoryPolicy(settings.working_memory_ttl_hours),
         write_status="quarantined" if settings.extraction_mode == "shadow" else "active",
     )
     log = structlog.get_logger()
     stop_event = stop_event or asyncio.Event()
+    embedding_client = None
     try:
+        embedding_client = build_embedding_client(settings)
         await asyncio.gather(
             maintenance_loop(
-                repository, settings.raw_event_retention_days, stop_event
+                repository, settings.raw_event_retention_days, stop_event, embedding_client
+            ),
+            worker_loop(
+                partial(process_one_deletion, repository),
+                settings.worker_poll_seconds,
+                stop_event,
             ),
             *[
                 worker_loop(
-                    repository,
-                    consolidator,
+                    partial(process_extraction_iteration, repository, consolidator),
                     settings.worker_poll_seconds,
                     stop_event,
                 )
@@ -153,6 +186,8 @@ async def run_worker(stop_event: asyncio.Event | None = None) -> None:
             if close_extractor is not None:
                 close_extractor()
         finally:
+            if embedding_client is not None:
+                embedding_client.http.close()
             await repository.close()
 
 
