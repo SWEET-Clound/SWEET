@@ -23,7 +23,7 @@ def build_embedding_client(settings: Settings) -> EmbeddingClient | None:
 
 
 class _EmbeddingRow(BaseModel):
-    index: int = Field(ge=0)
+    index: int = Field(strict=True, ge=0)
     embedding: list[float]
 
 
@@ -42,9 +42,17 @@ class EmbeddingClient:
     def embed(self, inputs: list[str]) -> list[list[float]]:
         if not inputs:
             return []
-        response = self.http.post("embeddings", json={"model": self.model, "input": inputs})
+        with self.http.stream(
+            "POST", "embeddings", json={"model": self.model, "input": inputs}
+        ) as response:
+            response.raise_for_status()
+            body = bytearray()
+            for chunk in response.iter_bytes(chunk_size=64 * 1024):
+                if len(body) + len(chunk) > 4 * 1024 * 1024:
+                    raise ValueError("embedding response exceeded the byte limit")
+                body.extend(chunk)
         rows = sorted(
-            _EmbeddingResponse.model_validate_json(response.raise_for_status().content).data,
+            _EmbeddingResponse.model_validate_json(body).data,
             key=lambda row: row.index,
         )
         if [row.index for row in rows] != list(range(len(inputs))):
@@ -57,4 +65,10 @@ class EmbeddingClient:
             for vector in vectors
         ):
             raise ValueError("embedding response contains an invalid vector")
-        return vectors
+        normalized = []
+        for vector in vectors:
+            scale = max(abs(value) for value in vector)
+            scaled = [value / scale for value in vector]
+            norm = math.hypot(*scaled)
+            normalized.append([value / norm for value in scaled])
+        return normalized

@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     event_encryption_fallback_key_file: Path | None = None
     event_encryption_rotate: bool = False
     extraction_model: str | None = None
+    consolidation_model: str | None = None
+    consolidation_limit_per_minute: int = Field(default=10, ge=1, le=1000)
     model_timeout_seconds: float = Field(default=30, ge=1, le=300)
     model_max_attempts: int = Field(default=2, ge=1, le=3)
     embedding_model: str | None = None
@@ -67,6 +69,8 @@ class Settings(BaseSettings):
     command_write_limit_per_minute: int = Field(default=30, ge=1, le=100_000)
     worker_concurrency: int = Field(default=4, ge=1, le=64)
     worker_poll_seconds: float = Field(default=1.0, ge=0.1, le=60)
+    worker_metrics_port: int | None = Field(default=None, ge=1, le=65535)
+    worker_metrics_host: str = "127.0.0.1"
 
     def build_event_cipher(self) -> EventCipher | None:
         primary = _read_event_key(
@@ -121,5 +125,7 @@ class Settings(BaseSettings):
             raise ValueError("embedding requires model_base_url and embedding_dimensions")
         if self.rerank_model and not self.model_base_url:
             raise ValueError("reranking requires model_base_url")
+        if self.consolidation_model and not self.model_base_url:
+            raise ValueError("consolidation requires model_base_url")
         return self
 

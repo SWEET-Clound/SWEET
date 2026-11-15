@@ -181,6 +181,32 @@ def test_hybrid_prefers_rule_evidence_over_model_confidence(kind: str) -> None:
     assert MemoryPolicy().evaluate_candidate(candidates[0], source).allowed
 
 
+@pytest.mark.parametrize("layer", [MemoryLayer.EPISODIC, MemoryLayer.SEMANTIC, MemoryLayer.PROCEDURAL])
+def test_affect_cannot_be_stored_in_longer_lived_layers(layer) -> None:
+    source = event("我今天非常焦虑")
+    candidate, = HeuristicExtractor().extract(source)
+    decision = MemoryPolicy().evaluate_candidate(
+        candidate.model_copy(update={"proposed_layer": layer}), source, procedure_preview=True,
+    )
+    assert not decision.allowed
+    assert decision.reason == "affect_requires_working_memory"
+
+
+@pytest.mark.parametrize("hours", [-1, 1])
+def test_affect_observation_time_must_match_source(hours: int) -> None:
+    source = event("我今天非常焦虑")
+    candidate, = HeuristicExtractor().extract(source)
+    assert candidate.affect is not None
+    affect = candidate.affect.model_copy(
+        update={"observed_at": source.occurred_at + timedelta(hours=hours)}
+    )
+    decision = MemoryPolicy().evaluate_candidate(
+        candidate.model_copy(update={"affect": affect}), source
+    )
+    assert not decision.allowed
+    assert decision.reason == "affect_observed_at_must_match_source"
+
+
 def test_hybrid_keeps_identical_text_in_distinct_layers() -> None:
     source = event("我非常焦虑，提醒我明天下午参加项目面试")
     heuristic = HeuristicExtractor()

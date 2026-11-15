@@ -78,7 +78,9 @@ Python 调用方可使用 `memory_system.client.MemoryClient`。传入自行管�
 查询，返回类型化结果。调用方负责重试，重试写入时复用原幂等键。
 
 `import_events` 逐条回放 `(EventRequest, 幂等键)` 并返回回执。中途失败时，已成功的写入
-保留，用原键重跑即可。`iter_memories` 分页导出当前身份可见的活跃记忆摘要。
+保留，用原键重跑即可。`iter_memories` 分页导出当前身份可见的记忆摘要，默认只导出活跃记忆。
+可传入 `layers` 和 `statuses` 筛选层级和状态，例如导出归档的 L2。
+隔离和拒绝状态仍需要 review 用途授权。分页反映各次读取时的数据库状态。
 摘要可能包含个人内容，应按业务数据保管。事件导入会走正常抽取策略，摘要导出不包含原始
 交互正文，也不用于原样恢复历史版本和证据关系。
 
@@ -129,16 +131,92 @@ MEMORY_MODEL_MAX_ATTEMPTS=2
 
 ## 数据生命周期
 
+事件写入、记忆命令和审核决定均要求身份令牌包含布尔值 `memory_write=true`。
+缺失或为 false 时返回 `403 memory_write_not_allowed`，读接口仍按用途与 scope 校验。
+审核决定还需要 `review` purpose。部署升级前，应核对写入客户端令牌包含该授权。
+
+用户确认跨事件摘要后，可通过现有 `remember` 命令保存摘要，将确认事件放在
+`source_event_id`，并在 `supporting_event_ids` 提供最多八条原始用户事件 ID。
+确认事件与支持事件使用不同的 ID。
+服务在同一事务中校验所有事件属于当前 scope、尚未脱敏且允许记忆，再写入摘要与去重后的
+证据链接。任一来源不合格时整笔命令回滚。应用迁移 `20261110_0019` 后，确认事件与支持事件
+均记录为摘要的必要来源，禁止其中任一条会使整条摘要退出召回并进入物理删除。
+升级前已写入的多来源摘要需要重新确认，才能补建必要来源关系。
+配置 `MEMORY_CONSOLIDATION_MODEL` 与 `MEMORY_MODEL_BASE_URL` 后，可调用
+`POST /v1/memory/consolidations:preview`，请求 `{"event_ids":["事件UUID1","事件UUID2"]}`。
+持有 `review` 权限的调用方可先用 `GET /v1/memory/consolidations/sources?thread_id=会话ID`
+查找同一会话内最近八条可供筛选的用户事件 ID。接口只返回 ID，预览阶段仍会校验内容和来源。
+若调用方没有会话 ID，可先用 `GET /v1/memory/consolidations/threads`，或调用 SDK 的
+`discover_consolidation_threads()`，列出最近有至少两条可供筛选事件的 20 个会话。
+预览请求也可以直接传 `{"thread_id":"会话ID"}`，由服务端选择该会话最近的合格来源。
+Python SDK 对应调用为 `preview_consolidation(thread_id="会话ID")`。
+可选来源不足两条时返回空列表。同一请求只能传 `thread_id` 或 `event_ids`。
+需要 `review` purpose，可选 2–8 条不同用户事件，正文总计最多 32000 字符。
+启用前确认配置的模型网关获准接收这些正文。服务解密并校验 scope、来源、禁止记忆与敏感规则，
+最多返回三条通过策略的 L2 摘要建议。模型用请求内的临时编号引用证据，每条建议至少引用两条
+不同事件。服务校验引用后转换为真实事件 ID，模型请求中不包含这些 ID。
+预览结果由用户审核，确认后记录新的用户确认事件，再用 `remember` 保存摘要及来源。
+保存 L2 候选时应一并传入 `expires_at`。有到期时间的 `remember` 写入 L2，
+到期时间须晚于当前数据库时间且不超过 180 天；省略该字段时维持原有 L3 语义。
+L2 摘要按到期规则退出普通召回，纠正时保留原到期时间。
+SDK 提供 `preview_consolidation` 与 `confirm_consolidation(proposal, confirmation_event_id,
+idempotency_key)`，确认方法自动带上候选到期时间和来源列表。
+调用确认方法前应取得用户确认并记录对应用户事件。
+迁移 `20261110_0020` 后，摘要预览默认按 tenant/user/agent 每分钟最多放行十次，
+可用 `MEMORY_CONSOLIDATION_LIMIT_PER_MINUTE` 调整。配额在 PostgreSQL 中跨 API 副本共享，
+来源校验失败不消耗配额，已放行请求的模型调用失败仍消耗配额。
+单次预览仍遵循 `MEMORY_MODEL_MAX_ATTEMPTS` 的重试上限。超限返回
+`429 model_rate_limited` 和 `Retry-After`。
+
+#### 后台巩固
+
+Worker 配置 `MEMORY_CONSOLIDATION_MODEL` 和 `MEMORY_MODEL_BASE_URL` 后，可为已授权的
+租户、用户和 Agent 生成审核草稿。授权默认关闭。具备 `review` 和记忆写权限的调用方可向
+`PUT /v1/memory/consolidations/background` 提交 `{"enabled":true}`。
+只具备 `review` 的调用方也可提交 `{"enabled":false}` 撤回授权，未确认草稿随即清除。
+
+Worker 每轮最多成功保存一批草稿，每批使用同一会话中的两到八条合格事件，最多生成
+两条 L2 草稿和一条 L4 草稿。后台处理从当前授权之后写入且允许自动抽取的用户事件中选取来源。
+每批最多发起两次逻辑模型调用，单次调用仍遵循模型重试配置。批次失败后冷却十分钟。
+
+审核方用 `GET /v1/memory/consolidations/background` 查询 `batches`，用响应中的
+`next_cursor` 获取下一页。使用批次的 `source_digest` 调用以下接口。
+
+- `POST /v1/memory/consolidations/background/{source_digest}/confirm` 需要
+  `review`、记忆写权限和 `Idempotency-Key`。传入 `ordinal`（从 0 开始）、
+  返回的完整 `draft` 和新记录的用户确认事件 `source_event_id`。确认一条草稿后关闭整批。
+- `DELETE /v1/memory/consolidations/background/{source_digest}` 需要 `review`，
+  用于驳回整批。驳回保留同一来源组合的去重记录。
+
+Python SDK 提供 `set_background_consolidation`、`list_background_consolidation_drafts`、
+`confirm_background_consolidation` 和 `dismiss_background_consolidation_drafts`。
+撤回任一来源会清除受影响的后台草稿。已经确认的记忆按现有证据依赖和删除流程处理。
+后台发现支持按会话分组，也可按同一作用域内有效记忆的 `subject_key` 发现跨会话候选。
+只有最近八条同主题的合格来源中至少来自两个会话时，才会生成跨会话候选。
+主题匹配只用于选择来源，生成的草稿仍须经过审核。
+配置巩固模型后，运行 `memory-eval --configured-consolidation` 可评测内置的四条中文
+多事件合成样本。该命令复用生产巩固提示词和引用校验，检查预期摘要、证据和应返回空结果的场景。
+评测只向配置的网关发送样本文本，无需启动数据库或写入记忆。
+配置向量模型后，还会在每个作用域最近的 32 个带向量事件中查找跨会话事件对。
+同一事件有多条可用记忆时，采用最近更新的记忆向量。
+比较仅使用当前模型和维度一致的向量，余弦相似度至少为 0.9 时进入同一审核流程。
+Worker 指标 `memory_worker_consolidation_discovery_duration_seconds` 按是否启用向量匹配
+记录候选发现耗时，计时覆盖数据库查询。
+
 - PostgreSQL 是唯一事实源；
 - 人工确认的 L4 只在查询与程序文本匹配时参与召回，不进入常驻核心画像；它始终按不可信
   data-only 上下文渲染，不能授予工具权限或绕过动作确认；
 - 每条派生记忆持久化 `subject_key`、敏感级别与投毒标记，供审核和治理查询；
 - 每个自动候选都写入隐私收敛的决策账本；即使策略拒绝候选，也可追踪拒绝原因，但被拒绝的
   凭证、隐私或投毒文本不会被复制进审计表；
-- 同一 `subject_key`、同一类型的不同用户陈述不会互相覆盖：系统以受 RLS 保护的
+- 对同一 `subject_key`、同一类型且有效窗口重叠的 L3 陈述，系统以受 RLS 保护的
   `contradicts` 关系保留双方，并用事务 advisory lock 避免并发写入漏检；列表与召回返回
   `conflict_memory_ids`，渲染上下文标记 `requires_confirmation=true`，且未决项降低召回排序；
   这是保守的“待确认”信号，不宣称字符串差异已经证明逻辑矛盾；
+- 具备 `review` 和记忆写权限的调用方可通过
+  `PUT /v1/memory/items/{memory_id}/conflicts/{other_id}/coexistence` 确认两条记忆可以并存。
+  Python SDK 对应方法是 `resolve_memory_conflict_as_coexisting(memory_id, other_id)`。
+  两条记忆均保留，重复提交返回 `204`，历史时间点召回仍可看到当时的未决关系；
 - 新事件和 extraction outbox 在同一事务提交；
 - worker 使用 `FOR UPDATE SKIP LOCKED`、租约恢复和最多五次指数退避；多副本 maintenance
   通过 PostgreSQL advisory lock 保证同一时刻只运行一次；Compose healthcheck 使用 worker
@@ -151,12 +229,44 @@ MEMORY_MODEL_MAX_ATTEMPTS=2
   并重试；保留 payload hash 是为了阻止同一幂等请求把已删内容复活；
 - 到期的 L1/其他临时记忆转为 `expired`；L2 转为 `archived`，不参与普通召回，但仍可在
   `history` 目的下按时间和证据查询，等待复核或后续保留策略处理；
+  具有 history 用途授权的调用方也可查询已过期的 L1 及当时的观测，用于追溯；
+  过期状态不等于物理删除，彻底移除仍应使用 forget 或 do_not_remember；
+- 普通召回中的 future_utility 排序加成随记忆有效起点衰减，未设置起点时使用创建时间。
+  L1 有当前查询时点之前的情绪观测时，改用该观测时间，避免新表达继续按旧状态降权。
+  L1 半衰期六小时，L2 半衰期三十天，history 查询和 L3/L4 保留原加成。
+  衰减只改变排序加成，有效期、查询命中与候选资格仍分别校验；
 - 原始事件超过保留期后擦除正文和 metadata，但保留最小证据壳与 ID；
 - 完成或失败的 outbox 记录七天后清理；
 - 召回诊断与原始事件使用相同保留天数，由 maintenance 定期物理清理；
-- 核心画像先于按需召回装入上下文、最多占 512 tokens；未入选画像的 L3 仍可按查询召回，
+- 查询命中项优先装入上下文，随后补入最多 512 tokens 的核心画像，再补其他场景候选。
+  未入选画像的 L3 仍可按查询召回，
   不会因为画像筛选而从事实源消失；
 - 记忆上下文使用 `<memory-data trust="untrusted">` 渲染，不能变成 system instruction。
+- 召回上下文仅在 `support` 和 `history` 用途返回结构化情绪观测。记忆正文仍按各用途的召回规则处理。
+
+`remember_procedure` 可传入最多八个 `supporting_event_ids`，用于确认从多次任务中总结出的流程。
+使用 `POST /v1/memory/consolidations:preview` 并传入 `kind: "procedure"` 和 2–8 个事件 ID，
+可用已配置的巩固模型生成待审核建议。需要 `review` 授权，与事件摘要共用限流。
+预览不会写入记忆。确认建议时，另传用户确认事件及建议所依据的事件 ID。
+SDK 可调用 `preview_consolidation(event_ids, kind="procedure")`，
+再用 `confirm_consolidation(proposal, confirmation_event_id, idempotency_key)` 提交用户确认。
+确认事件和支持事件均须来自当前身份范围内的用户。纠正后的 L4 版本继承必需来源，
+撤回其中一个来源会让依赖它的版本退出召回并排入删除。
+若并发确认在纠正期间追加了必需来源，纠正返回 `409 memory_sources_changed`，
+调用方可用原幂等键和原请求重试，服务会重新校验完整来源。
+
+迁移 `20261110_0022` 后，每条新抽取的情绪观测按记忆 ID 和来源事件 ID 单独保存，
+包含观测时间、到期时间和入库时间。可通过
+`GET /v1/memory/items/{memory_id}/affect-history?purpose=history&limit=50` 查询，
+需要令牌具有 history 或请求指定的 support 用途；单次最多返回最新 100 条。
+可选 `as_of` 接受带时区的时间，只返回截至该时点已发生且已入库的观测与来源事件。
+SDK 提供 `affect_history`。撤回事件后，该事件的观测立即不可见，worker 会物理移除记录；
+迁移 `20261113_0026` 会清理历史 L2/L3/L4 的结构化情绪字段及观测记录。
+降级只能移除新增约束，已清理的观测无法通过降级恢复。
+撤回最新观测时，当前情绪摘要回退到仍获准保留的最新观测。删除记忆会级联删除全部观测。
+回退同时收敛有效期，被撤回的较新来源不会继续延长状态保留时间。
+L1 召回会按查询时点选择当时已经入库且来源获准保留的最新情绪观测，
+并返回该观测的有效期。升级前被覆盖的旧观测无法自动恢复。
 
 ## 本地源码运行
 
@@ -196,18 +306,20 @@ memory-eval
 模型模式会把通过输入过滤的样本文本发给配置的模型服务，并按通过写入策略的候选层级评分。
 默认使用内置合成样本，自定义文件应先脱敏并确认获准发送。
 
-真实数据库测试要求 owner URL `MEMORY_TEST_DATABASE_URL` 和 RLS 受限角色 URL
-`MEMORY_TEST_APP_DATABASE_URL` 都指向名称以 `_test` 结尾的同一个可丢弃数据库；测试会自动
-执行 migration：
+完整的真实数据库回归需要 owner、API 和 worker 三个连接地址。三个地址须指向同一个
+以 `_test` 结尾的可丢弃数据库，测试会自动执行迁移和清理数据。
 
-```bash
-set MEMORY_TEST_DATABASE_URL=postgresql+psycopg://.../memory_test
-set MEMORY_TEST_APP_DATABASE_URL=postgresql+psycopg://memory_app:.../memory_test
+Windows PowerShell 中设置连接地址后运行测试：
+
+```powershell
+$env:MEMORY_TEST_DATABASE_URL = 'postgresql+psycopg://owner:...@127.0.0.1:5432/memory_test'
+$env:MEMORY_TEST_APP_DATABASE_URL = 'postgresql+psycopg://memory_app:...@127.0.0.1:5432/memory_test'
+$env:MEMORY_TEST_WORKER_DATABASE_URL = 'postgresql+psycopg://memory_worker:...@127.0.0.1:5432/memory_test'
 pytest -q -m postgres
 ```
 
-另设 `MEMORY_TEST_WORKER_DATABASE_URL` 指向同一个测试库的专用 worker 角色，可额外运行
-应用角色写入、worker 角色抽取与物理删除的分权回归。
+Linux 或 macOS 使用 `export NAME='值'` 设置同名变量。请将示例中的地址和凭据替换为
+测试库配置。缺少角色地址时，对应的分权回归会跳过。
 
 ## 生产部署前必须替换
 
@@ -236,6 +348,24 @@ pg_restore --dbname=service=memory_restore --exit-on-error --single-transaction 
 恢复目标使用单独的空数据库。先创建备份中引用的数据库角色，再恢复并检查
 `alembic_version`、业务样本、RLS 和角色权限。演练通过后，使用应用与 worker 角色跑一次
 写入、召回和删除闭环。逻辑备份只能恢复到快照时点，PITR 还需要物理基备与连续 WAL 归档。
+
+### PostgreSQL 时间点恢复演练
+
+1. 在隔离的 PostgreSQL 16 实例开启 `archive_mode`，配置 `archive_command` 或
+   `archive_library`，确认归档端能收到 WAL。使用 `pg_basebackup -X stream` 创建物理基备。
+2. 基备完成后写入一条合成探针，执行 `SELECT pg_create_restore_point('memory_probe');`，
+   再删除探针并执行 `SELECT pg_switch_wal();`。等待归档中出现包含恢复点的 WAL 段。
+   可用 `pg_waldump` 核对恢复点所在的段。
+3. 在单独的数据目录和端口启动恢复实例。配置 `restore_command` 从归档把 `%f` 复制到
+   `%p`，找不到文件时返回非零。设置 `recovery_target_name = 'memory_probe'`、
+   `recovery_target_action = 'promote'`，并在数据目录创建空文件 `recovery.signal`。
+   Windows 上使用 `copy /Y` 时，源归档路径使用带引号的 Windows 原生路径。
+4. 确认 `pg_is_in_recovery()` 返回 false，且恢复实例中存在源实例已删除的探针。
+   对业务副本继续核验迁移版本、密钥可用性、RLS 与角色权限，并用合成数据跑写入、召回和删除。
+   在开放流量前，核对恢复点之后的删除与禁止记忆请求，补做仍应生效的撤回。
+
+本地演练结果见 [验收记录](ACCEPTANCE.md)。归档配置与恢复目标的完整语义见
+[PostgreSQL 16 连续归档与时间点恢复](https://www.postgresql.org/docs/16/continuous-archiving.html)。
 
 第一版有意不包含 Redis、Kafka、Celery、Neo4j、独立向量数据库或自动 L4。当前召回使用
 PostgreSQL FTS、中文 trigram、精确 subject、最近情景和 L3/L1 场景候选，并以 RRF 融合；
@@ -280,3 +410,24 @@ API 使用同一配置生成查询向量，并将语义候选融入召回。查�
 `profile_only` 表示只选到核心画像，`empty` 表示未选中任何记忆。持续升高的
 `context_only` 比例可用于排查跨主题召回或相关候选被预算挤出的情况。它是诊断信号，
 无法单独证明语义无关。指标标签仅含用途和结果，不包含用户标识、查询或记忆正文。
+
+将 `deploy/alerts.yml` 加入现有 Prometheus 的 `rule_files`，并采集每个 API 实例的
+`/metrics`。默认告警为五分钟内至少 20 次写入限流且持续两分钟，以及十五分钟内至少
+100 次有查询的召回、情景兜底比例超过一半且持续十分钟。阈值是初始运维配置，
+需要按实际流量调整。独立服务部署应分配不同的 Prometheus `job`，
+防止同名用途的指标混合。告警通知由现有 Alertmanager 路由负责。
+在 `deploy` 目录执行 `promtool check rules alerts.yml` 和
+`promtool test rules alerts.test.yml` 可检查规则及触发、低流量抑制样例。
+
+`memory_http_request_duration_seconds` 提供接口处理耗时的直方图，失败请求也记录耗时。
+path 标签使用路由模板，未匹配路径统一为 unmatched，避免把用户输入或具体 ID 放进标签。
+例如可用 `histogram_quantile(0.95, sum by (le, path)
+(rate(memory_http_request_duration_seconds_bucket[5m])))` 观察各接口的 P95 处理延迟。
+该指标截止到响应头就绪，客户端网络传输耗时需由网关或客户端另外测量。
+
+召回阶段耗时可通过 `memory_recall_stage_duration_seconds` 查看，按画像查询、候选检索、
+查询向量生成和重排分组。Worker 由独立进程提供指标。Compose 网络内可采集
+`http://worker:9091/metrics`。独立运行时设置 `MEMORY_WORKER_METRICS_PORT` 启用，
+默认仅监听回环地址，可用 `MEMORY_WORKER_METRICS_HOST` 调整。该端点无鉴权，
+应放在受控的监控网络内。`memory_worker_deletion_duration_seconds` 记录有实际工作或
+发生错误的删除尝试耗时，包含数据库领取操作。

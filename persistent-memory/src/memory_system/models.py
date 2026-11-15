@@ -4,6 +4,7 @@ import json
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
+from uuid import UUID
 
 from pydantic import AfterValidator, AwareDatetime, BaseModel, Field
 
@@ -15,6 +16,14 @@ def _bounded_metadata(value: dict[str, Any]) -> dict[str, Any]:
 
 
 BoundedMetadata = Annotated[dict[str, Any], AfterValidator(_bounded_metadata)]
+
+
+def _uuid_text(value: str) -> str:
+    UUID(value)
+    return value
+
+
+UUIDText = Annotated[str, AfterValidator(_uuid_text)]
 
 
 class EventSource(StrEnum):
@@ -53,6 +62,20 @@ class MemoryScope(BaseModel):
     agent_id: str
 
 
+class ConsolidationRequest(BaseModel, extra="forbid"):
+    event_ids: list[UUID] = Field(min_length=2, max_length=8)
+    kind: Literal["episode", "procedure"] = "episode"
+
+
+class ThreadConsolidationRequest(BaseModel, extra="forbid"):
+    thread_id: str = Field(min_length=1, max_length=128)
+    kind: Literal["episode", "procedure"] = "episode"
+
+
+class BackgroundConsolidationConsent(BaseModel, extra="forbid"):
+    enabled: Annotated[bool, Field(strict=True)]
+
+
 class InteractionEvent(BaseModel):
     tenant_id: str
     user_id: str
@@ -88,6 +111,8 @@ class MemoryContextItem(BaseModel):
     conflict_memory_ids: list[str] = Field(default_factory=list)
     query_matched: bool = Field(default=False, exclude=True)
     rerank_eligible: bool = Field(default=False, exclude=True)
+    expires_at: datetime | None = None
+    affect: AffectSignal | None = None
 
 
 class MemoryContext(BaseModel):
@@ -174,6 +199,15 @@ class AffectSignal(BaseModel):
     derived_from: Literal["text", "voice", "multimodal"]
 
 
+class AffectObservation(BaseModel):
+    memory_id: str
+    event_id: str
+    affect: AffectSignal
+    observed_at: datetime
+    expires_at: datetime | None
+    recorded_at: datetime
+
+
 class MemoryCandidate(BaseModel):
     statement: str = Field(min_length=1, max_length=10_000)
     proposed_layer: MemoryLayer
@@ -189,6 +223,22 @@ class MemoryCandidate(BaseModel):
     affect: AffectSignal | None
     sensitivity: Literal["low", "medium", "high", "secret"]
     poisoning_flags: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(max_length=8)
+
+
+class BackgroundConsolidationDraftBatch(BaseModel):
+    source_digest: str
+    drafts: list[MemoryCandidate]
+
+
+class BackgroundConsolidationDraftPage(BaseModel):
+    batches: list[BackgroundConsolidationDraftBatch]
+    next_cursor: str | None
+
+
+class BackgroundConsolidationConfirmation(BaseModel, extra="forbid"):
+    ordinal: int = Field(ge=0, le=2)
+    draft: MemoryCandidate
+    source_event_id: UUIDText
 
 
 class CandidateDecision(BaseModel):
@@ -218,6 +268,8 @@ class RememberCommand(BaseModel):
     scope: MemoryScope
     statement: str = Field(min_length=1, max_length=10_000)
     source_event_id: str
+    supporting_event_ids: list[str] = Field(default_factory=list, max_length=8)
+    expires_at: AwareDatetime | None = None
 
 
 class RememberProcedureCommand(BaseModel):
@@ -225,6 +277,7 @@ class RememberProcedureCommand(BaseModel):
     scope: MemoryScope
     statement: str = Field(min_length=1, max_length=10_000)
     source_event_id: str
+    supporting_event_ids: list[str] = Field(default_factory=list, max_length=8)
 
 
 class CorrectCommand(BaseModel):
@@ -297,37 +350,40 @@ class RecallRequestBody(BaseModel):
 class RememberRequest(BaseModel):
     action: Literal["remember"]
     statement: str = Field(min_length=1, max_length=10_000)
-    source_event_id: str
+    source_event_id: UUIDText
+    supporting_event_ids: list[UUIDText] = Field(default_factory=list, max_length=8)
+    expires_at: AwareDatetime | None = None
 
 
 class RememberProcedureRequest(BaseModel):
     action: Literal["remember_procedure"]
     statement: str = Field(min_length=1, max_length=10_000)
-    source_event_id: str
+    source_event_id: UUIDText
+    supporting_event_ids: list[UUIDText] = Field(default_factory=list, max_length=8)
 
 
 class CorrectRequest(BaseModel):
     action: Literal["correct"]
-    memory_id: str
+    memory_id: UUIDText
     replacement: str = Field(min_length=1, max_length=10_000)
-    source_event_id: str
+    source_event_id: UUIDText
 
 
 class CorrectProcedureRequest(BaseModel):
     action: Literal["correct_procedure"]
-    memory_id: str
+    memory_id: UUIDText
     replacement: str = Field(min_length=1, max_length=10_000)
-    source_event_id: str
+    source_event_id: UUIDText
 
 
 class ForgetRequest(BaseModel):
     action: Literal["forget"]
-    memory_ids: list[str] = Field(min_length=1, max_length=100)
+    memory_ids: list[UUIDText] = Field(min_length=1, max_length=100)
 
 
 class DoNotRememberRequest(BaseModel):
     action: Literal["do_not_remember"]
-    event_ids: list[str] = Field(min_length=1, max_length=100)
+    event_ids: list[UUIDText] = Field(min_length=1, max_length=100)
 
 
 CommandRequest = Annotated[

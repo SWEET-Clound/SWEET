@@ -6,6 +6,7 @@ from fastapi import FastAPI
 
 from memory_system.api import JwtAuthenticator, create_app
 from memory_system.embedding import build_embedding_client
+from memory_system.llm import build_consolidation_extractor
 from memory_system.policy import MemoryPolicy
 from memory_system.postgres import PostgresRepository
 from memory_system.rerank import RerankClient
@@ -44,8 +45,10 @@ def create_application() -> FastAPI:
             ),
             settings.rerank_model,
         )
+    consolidation_extractor = build_consolidation_extractor(settings)
     system = MemorySystem(
-        repository, MemoryPolicy(), settings.max_context_tokens, embedding_client, rerank_client
+        repository, MemoryPolicy(), settings.max_context_tokens, embedding_client, rerank_client,
+        consolidation_extractor, settings.consolidation_limit_per_minute,
     )
 
     @asynccontextmanager
@@ -57,6 +60,8 @@ def create_application() -> FastAPI:
                 embedding_client.http.close()
             if rerank_client is not None:
                 await rerank_client.http.aclose()
+            if consolidation_extractor is not None:
+                consolidation_extractor.close()
             await repository.close()
 
     return create_app(system, authenticate, lifespan)

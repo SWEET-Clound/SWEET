@@ -16,6 +16,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: persistent-memory
@@ -51,5 +52,68 @@ jobs:
       - name: Apply packaged migrations
         run: MEMORY_DATABASE_URL="$MEMORY_TEST_DATABASE_URL" memory-migrate
       - run: ruff check src migrations tests
+      - name: Validate operational alert rules
+        run: |
+          docker run --rm --entrypoint /bin/promtool -v "$PWD/deploy:/rules:ro" -w /rules prom/prometheus:v3.5.0 check rules alerts.yml
+          docker run --rm --entrypoint /bin/promtool -v "$PWD/deploy:/rules:ro" -w /rules prom/prometheus:v3.5.0 test rules alerts.test.yml
       - run: memory-eval
       - run: pytest -q
+      - name: Run encrypted HTTP lifecycle smoke
+        env:
+          MEMORY_ENVIRONMENT: development
+          MEMORY_DATABASE_URL: ${{ env.MEMORY_TEST_APP_DATABASE_URL }}
+          MEMORY_WORKER_DATABASE_URL: ${{ env.MEMORY_TEST_WORKER_DATABASE_URL }}
+          MEMORY_JWT_ISSUER: memory-ci
+          MEMORY_JWT_AUDIENCE: memory-ci
+          MEMORY_EXTRACTION_MODE: heuristic
+          MEMORY_WORKER_POLL_SECONDS: '0.1'
+        run: |
+          export MEMORY_DEV_JWT_SECRET="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          export MEMORY_EVENT_ENCRYPTION_KEY="$(python -c 'import base64,secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())')"
+          python -m uvicorn memory_system.bootstrap:create_application --factory --host 127.0.0.1 --port 8080 > api-smoke.log 2>&1 &
+          api_pid=$!
+          memory-worker > worker-smoke.log 2>&1 &
+          worker_pid=$!
+          trap 'kill "$worker_pid" "$api_pid" 2>/dev/null || true; wait "$worker_pid" "$api_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..30}; do
+            if python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/ready')" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          if ! timeout --signal=TERM 60s memory-smoke --base-url http://127.0.0.1:8080 --timeout 30; then
+            cat api-smoke.log worker-smoke.log
+            exit 1
+          fi
+      - name: Verify Linux Compose images and lifecycle
+        run: |
+          export COMPOSE_PROJECT_NAME="memory-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker compose down --volumes' EXIT
+          if ! docker compose up --build --wait --wait-timeout 120 ||
+             ! timeout 60s docker compose exec -T api memory-smoke --base-url http://127.0.0.1:8080 --timeout 30 ||
+             ! timeout 20s docker compose exec -T api python - <<'PY'
+          import time
+          from urllib.request import urlopen
+
+          from prometheus_client.parser import text_string_to_metric_families
+
+          # The deletion receipt may become visible before the worker records its metric.
+          for _ in range(10):
+              with urlopen("http://worker:9091/metrics", timeout=2) as response:
+                  families = text_string_to_metric_families(response.read().decode())
+                  if any(
+                      sample.name == "memory_worker_deletion_duration_seconds_count"
+                      and sample.labels == {"result": "completed"}
+                      and sample.value >= 1
+                      for family in families for sample in family.samples
+                  ):
+                      break
+              time.sleep(1)
+          else:
+              raise SystemExit("Worker metrics did not report a completed deletion")
+          PY
+          then
+            docker compose ps -a
+            docker compose logs --no-color
+            exit 1
+          fi

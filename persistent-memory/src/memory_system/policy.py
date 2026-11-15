@@ -1,12 +1,23 @@
 import re
 from dataclasses import dataclass
 from datetime import timedelta
+from unicodedata import normalize
 
 from memory_system.models import EventSource, InteractionEvent, MemoryCandidate, MemoryLayer
 
-_OPT_OUT = re.compile(r"^\s*(?:请|麻烦)?\s*(?:你)?\s*(?:不要|别)\s*(?:记住|记录|保存)")
+_OPT_OUT = re.compile(
+    r"^\s*(?:请|麻烦)?\s*(?:你)?\s*(?:不要|别|勿|不用|无需)\s*"
+    r"(?:(?:再|继续)\s*)?(?:记住|记录|保存)"
+)
+_ENGLISH_OPT_OUT = re.compile(
+    r"^\s*(?:please\s+)?(?:do\s+not|don['’]t|never)\s+"
+    r"(?:remember\s+(?:this|that|it)\b"
+    r"|(?:save|store|record)\s+(?:this|that|it)\s+(?:in|to)\s+memory\b)",
+    re.IGNORECASE,
+)
 REMEMBER_PREFIX = re.compile(r"^\s*(?:请|麻烦)?\s*(?:你)?\s*记住\s*[：:]?\s*(?P<fact>\S.*)$")
 EPISODIC_TTL = timedelta(days=180)
+_INVISIBLE_CHARACTERS = str.maketrans("", "", "\u200b\u200c\u200d\ufeff")
 
 
 def explicitly_opts_out(event: InteractionEvent) -> bool:
@@ -14,7 +25,10 @@ def explicitly_opts_out(event: InteractionEvent) -> bool:
 
 
 def is_memory_opt_out(source: str, content: str) -> bool:
-    return source == EventSource.USER and bool(_OPT_OUT.match(content))
+    if source != EventSource.USER:
+        return False
+    normalized = normalize("NFKC", content).translate(_INVISIBLE_CHARACTERS)
+    return bool(_OPT_OUT.match(normalized) or _ENGLISH_OPT_OUT.match(normalized))
 
 _SECRET_PATTERNS = (
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
@@ -27,8 +41,13 @@ _SECRET_PATTERNS = (
     re.compile(r"(?:诊断为|患有|确诊)\s*[^，。,.]{1,40}"),
 )
 _INSTRUCTION_PATTERNS = (
-    re.compile(r"忽略(?:之前|以上|系统).*(?:规则|指令|提示)", re.IGNORECASE),
-    re.compile(r"(?:system prompt|系统提示词|越过权限|绕过安全)", re.IGNORECASE),
+    re.compile(r"忽略(?:之前|以上|系统).*(?:规则|指令|提示)", re.IGNORECASE | re.DOTALL),
+    re.compile(r"(?:system\s+prompt|系统提示词|越过权限|绕过安全)", re.IGNORECASE),
+    re.compile(
+        r"\b(?:ignore|disregard|override)\s+(?:(?:all|the|any|of)\s+)*"
+        r"(?:previous|prior|above|system|developer)\s+(?:instructions?|rules?|prompts?)\b",
+        re.IGNORECASE,
+    ),
 )
 
 
@@ -39,12 +58,13 @@ class WriteDecision:
 
 
 class MemoryPolicy:
-    version = "2026-11-candidate-metadata-v6"
+    version = "2026-11-candidate-metadata-v11"
 
     def __init__(self, working_memory_ttl_hours: int = 72) -> None:
         self.working_memory_ttl = timedelta(hours=working_memory_ttl_hours)
 
     def evaluate_explicit_memory(self, statement: str) -> WriteDecision:
+        statement = normalize("NFKC", statement).translate(_INVISIBLE_CHARACTERS)
         if any(pattern.search(statement) for pattern in _SECRET_PATTERNS):
             return WriteDecision(False, "credentials_and_secrets_are_not_stored")
         if any(pattern.search(statement) for pattern in _INSTRUCTION_PATTERNS):
@@ -52,7 +72,8 @@ class MemoryPolicy:
         return WriteDecision(True)
 
     def evaluate_candidate(
-        self, candidate: MemoryCandidate, event: InteractionEvent | None = None
+        self, candidate: MemoryCandidate, event: InteractionEvent | None = None,
+        *, procedure_preview: bool = False,
     ) -> WriteDecision:
         if event is not None and event.source is not EventSource.USER:
             return WriteDecision(False, "source_cannot_create_user_memory")
@@ -67,6 +88,11 @@ class MemoryPolicy:
             content_decision = self.evaluate_explicit_memory(value)
             if not content_decision.allowed:
                 return content_decision
+        if candidate.affect is not None:
+            if candidate.proposed_layer is not MemoryLayer.WORKING:
+                return WriteDecision(False, "affect_requires_working_memory")
+            if event is not None and candidate.affect.observed_at != event.occurred_at:
+                return WriteDecision(False, "affect_observed_at_must_match_source")
         if candidate.valid_from is not None and any(
             end is not None and end <= candidate.valid_from
             for end in (candidate.valid_to, candidate.expires_at)
@@ -103,7 +129,7 @@ class MemoryPolicy:
             statement = " ".join(candidate.statement.split())
             if statement != fact:
                 return WriteDecision(False, "semantic_memory_requires_verbatim_evidence")
-        if candidate.proposed_layer is MemoryLayer.PROCEDURAL:
+        if candidate.proposed_layer is MemoryLayer.PROCEDURAL and not procedure_preview:
             return WriteDecision(False, "procedural_memory_requires_verified_outcomes")
         return WriteDecision(True)
 

@@ -100,10 +100,15 @@ def check_worker_database(database_url: str) -> None:
         connection.execute(
             """
             SELECT memory_event.ciphertext, memory_event.ciphertext_key_id,
-                   memory_event.ciphertext_retry_at
+                   memory_event.ciphertext_retry_at, memory_event.background_eligible_at,
+                   memory_consolidation_opt_in.enabled_at,
+                   memory_consolidation_run.drafts, memory_consolidation_run.source_ids,
+                   memory_consolidation_run.retry_at
             FROM memory_outbox, deletion_job, memory_event, memory_item,
                           memory_candidate_decision, memory_recall_diagnostic,
-                          memory_write_rate_limit, memory_embedding
+                          memory_write_rate_limit, memory_embedding, memory_dependency,
+                          memory_affect_observation, memory_consolidation_opt_in,
+                          memory_consolidation_run
             LIMIT 0
             """
         )

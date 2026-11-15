@@ -4,9 +4,9 @@ import hashlib
 import json
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import structlog
 from cryptography.exceptions import InvalidTag
@@ -15,7 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 
 from memory_system.event_cipher import EventCipher
 from memory_system.models import (
+    AffectObservation,
     AuditEntry,
+    BackgroundConsolidationDraftBatch,
+    BackgroundConsolidationDraftPage,
     CandidateDecision,
     CandidateDecisionAudit,
     CommandReceipt,
@@ -43,6 +46,16 @@ from memory_system.models import (
 )
 from memory_system.policy import explicitly_opts_out, is_memory_opt_out
 
+_BACKGROUND_CONSOLIDATION_FROM = """
+    FROM memory_event e
+    JOIN memory_consolidation_opt_in consent USING (tenant_id, user_id, agent_id)
+"""
+_BACKGROUND_CONSOLIDATION_FILTER = """
+    WHERE e.source='user' AND NOT e.prohibited_from_memory AND e.redacted_at IS NULL
+      AND e.occurred_at <= now() AND e.background_eligible_at >= consent.enabled_at
+"""
+_BACKGROUND_CONSOLIDATION_EVENTS = _BACKGROUND_CONSOLIDATION_FROM + _BACKGROUND_CONSOLIDATION_FILTER
+
 
 class IdempotencyConflictError(Exception):
     pass
@@ -56,11 +69,19 @@ class MemoryDeletionInProgress(Exception):
     pass
 
 
+class MemorySourcesChanged(Exception):
+    pass
+
+
 class DeletionCanaryFailed(RuntimeError):
     pass
 
 
 class EventPayloadUnreadable(RuntimeError):
+    pass
+
+
+class InvalidMemoryExpiry(ValueError):
     pass
 
 
@@ -112,25 +133,35 @@ class PostgresRepository:
                 text(
                     """
                     SELECT memory_event.ciphertext, memory_event.ciphertext_key_id,
-                           memory_event.ciphertext_retry_at
+                           memory_event.ciphertext_retry_at, memory_event.background_eligible_at,
+                           memory_consolidation_opt_in.enabled_at,
+                           memory_consolidation_run.drafts, memory_consolidation_run.source_ids,
+                           memory_item.last_reinforced_at, memory_relation.resolved_at
                     FROM memory_event, memory_item, memory_outbox, memory_evidence,
                          command_dedup, deletion_job, memory_relation, memory_audit,
                          memory_candidate_decision, memory_recall_diagnostic,
-                         memory_write_rate_limit, memory_embedding
+                         memory_write_rate_limit, memory_embedding, memory_dependency,
+                         memory_affect_observation, memory_consolidation_opt_in,
+                         memory_consolidation_run
                     LIMIT 0
                     """
                 )
             )
 
     @asynccontextmanager
-    async def embedding_backfill_lock(self, model: str, dimensions: int) -> AsyncIterator[bool]:
-        key = f"persistent-memory-embedding:{dimensions}:{model}"
+    async def _try_worker_lock(self, key: str) -> AsyncIterator[bool]:
         async with self.engine.begin() as connection:
             lock = await connection.execute(
                 text("SELECT pg_try_advisory_xact_lock(hashtextextended(:key, 0))"),
                 {"key": key},
             )
             yield lock.scalar_one()
+
+    def embedding_backfill_lock(self, model: str, dimensions: int):
+        return self._try_worker_lock(f"persistent-memory-embedding:{dimensions}:{model}")
+
+    def background_consolidation_lock(self):
+        return self._try_worker_lock("persistent-memory-background-consolidation")
 
     async def pending_embeddings(self, model: str, dimensions: int) -> list[tuple[str, str]]:
         async with self.engine.connect() as connection:
@@ -187,6 +218,301 @@ class PostgresRepository:
             )
             return stored.first() is not None
 
+    async def consume_consolidation_quota(self, scope: MemoryScope, limit: int) -> None:
+        async with self.engine.begin() as connection:
+            await self._set_scope(connection, scope)
+            await self._consume_write_quota(connection, scope, "consolidation", limit)
+
+    async def set_background_consolidation(self, scope: MemoryScope, enabled: bool) -> None:
+        async with self.engine.begin() as connection:
+            await self._set_scope(connection, scope)
+            if enabled:
+                statement = """
+                    INSERT INTO memory_consolidation_opt_in (tenant_id, user_id, agent_id)
+                    VALUES (:tenant_id, :user_id, :agent_id)
+                    ON CONFLICT DO NOTHING
+                """
+            else:
+                statement = """
+                    DELETE FROM memory_consolidation_opt_in
+                    WHERE tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
+                """
+            await connection.execute(text(statement), scope.model_dump())
+
+    async def discover_consolidation_threads(self, scope: MemoryScope) -> list[str]:
+        async with self.engine.begin() as connection:
+            await self._set_scope(connection, scope)
+            rows = await connection.execute(
+                text(
+                    """
+                    SELECT thread_id FROM memory_event e
+                    WHERE tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
+                      AND source='user' AND NOT prohibited_from_memory AND redacted_at IS NULL
+                      AND occurred_at <= now()
+                    GROUP BY thread_id
+                    HAVING count(*) >= 2
+                    ORDER BY max(occurred_at) DESC, thread_id
+                    LIMIT 20
+                    """
+                ),
+                scope.model_dump(),
+            )
+            return list(rows.scalars())
+
+    async def discover_background_consolidation_batches(
+        self, *, embedding_model: str | None = None, embedding_dimensions: int | None = None,
+    ) -> list[tuple[MemoryScope, list[str]]]:
+        async with self.engine.connect() as connection:
+            rows = await connection.execute(text(f"""
+                WITH eligible_evidence AS (
+                    SELECT DISTINCT e.tenant_id, e.user_id, e.agent_id, e.thread_id,
+                           e.id, e.occurred_at, m.subject_key, m.id AS memory_id,
+                           m.updated_at AS memory_updated_at
+                    {_BACKGROUND_CONSOLIDATION_FROM}
+                    JOIN memory_evidence ev ON ev.event_id=e.id
+                    JOIN memory_item m ON m.id=ev.memory_id
+                      AND (m.tenant_id, m.user_id, m.agent_id)=(e.tenant_id, e.user_id, e.agent_id)
+                    {_BACKGROUND_CONSOLIDATION_FILTER}
+                      AND m.status='active'
+                      AND m.sensitivity IN ('low','medium') AND cardinality(m.poisoning_flags)=0
+                      AND (m.valid_from IS NULL OR m.valid_from<=now())
+                      AND (m.valid_to IS NULL OR m.valid_to>now())
+                      AND (m.expires_at IS NULL OR m.expires_at>now())
+                ), grouped_events AS (
+                    SELECT e.tenant_id, e.user_id, e.agent_id, e.thread_id,
+                           e.id, e.occurred_at, e.thread_id AS group_key, false AS cross_thread
+                    {_BACKGROUND_CONSOLIDATION_EVENTS}
+                    UNION ALL
+                    SELECT DISTINCT tenant_id, user_id, agent_id, thread_id,
+                           id, occurred_at, subject_key, true
+                    FROM eligible_evidence WHERE subject_key IS NOT NULL
+                ), event_vectors AS (
+                    SELECT DISTINCT ON (evidence.id) evidence.*, v.embedding
+                    FROM eligible_evidence evidence
+                    JOIN memory_embedding v ON v.memory_id=evidence.memory_id
+                    WHERE v.model=:embedding_model AND v.dimensions=:embedding_dimensions
+                    ORDER BY evidence.id, evidence.memory_updated_at DESC, evidence.memory_id
+                ), recent_vectors AS (
+                    SELECT *, row_number() OVER (
+                        PARTITION BY tenant_id, user_id, agent_id
+                        ORDER BY occurred_at DESC, id DESC
+                    ) AS position
+                    FROM event_vectors
+                ), bounded_vectors AS MATERIALIZED (
+                    SELECT recent.*, norms.squared_norm
+                    FROM recent_vectors recent
+                    CROSS JOIN LATERAL (
+                        SELECT sum(value::double precision * value) AS squared_norm
+                        FROM unnest(recent.embedding) AS components(value)
+                    ) norms
+                    WHERE position<=32 AND norms.squared_norm>0
+                ), ranked AS (
+                    SELECT *, row_number() OVER (
+                        PARTITION BY tenant_id, user_id, agent_id, cross_thread, group_key
+                        ORDER BY occurred_at DESC, id DESC
+                    ) AS position FROM grouped_events
+                ), batches AS (
+                    SELECT tenant_id, user_id, agent_id,
+                           array_agg(id ORDER BY id) AS source_ids, max(occurred_at) AS latest
+                    FROM ranked WHERE position<=8
+                    GROUP BY tenant_id, user_id, agent_id, cross_thread, group_key
+                    HAVING count(*)>=2 AND (NOT cross_thread OR count(DISTINCT thread_id)>=2)
+                    UNION ALL
+                    SELECT a.tenant_id, a.user_id, a.agent_id,
+                           ARRAY[a.id,b.id], greatest(a.occurred_at,b.occurred_at)
+                    FROM bounded_vectors a JOIN bounded_vectors b
+                      USING (tenant_id, user_id, agent_id)
+                    CROSS JOIN LATERAL (
+                        -- Event IDs are globally unique, so the pair identifies the source batch.
+                        SELECT CASE WHEN ARRAY[a.id,b.id] NOT IN (
+                            SELECT r.source_ids FROM memory_consolidation_run r
+                            WHERE cardinality(r.source_ids)=2 AND (r.retry_at IS NULL OR r.retry_at>now())
+                        ) THEN (
+                            SELECT sum(x::double precision * y)
+                                / sqrt(a.squared_norm * b.squared_norm)
+                            FROM unnest(a.embedding, b.embedding) AS pairs(x,y)
+                        ) END AS score
+                    ) similarity
+                    WHERE a.id<b.id
+                      AND a.thread_id<>b.thread_id AND a.memory_id<>b.memory_id
+                      AND (a.subject_key IS NULL OR a.subject_key IS DISTINCT FROM b.subject_key)
+                      AND similarity.score BETWEEN 0.9 AND 1.000001
+                )
+                SELECT b.tenant_id, b.user_id, b.agent_id, b.source_ids
+                FROM batches b
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM memory_consolidation_run r
+                    WHERE (r.tenant_id, r.user_id, r.agent_id)=(b.tenant_id, b.user_id, b.agent_id)
+                      AND r.source_ids=b.source_ids AND (r.retry_at IS NULL OR r.retry_at>now())
+                )
+                GROUP BY b.tenant_id, b.user_id, b.agent_id, b.source_ids
+                ORDER BY min(b.latest), b.tenant_id, b.user_id, b.agent_id, b.source_ids
+                LIMIT 20
+            """), {"embedding_model": embedding_model, "embedding_dimensions": embedding_dimensions})
+            return [
+                (MemoryScope.model_validate(row), [str(value) for value in row["source_ids"]])
+                for row in rows.mappings()
+            ]
+
+    async def discover_consolidation_sources(self, scope: MemoryScope, thread_id: str) -> list[str]:
+        async with self.engine.begin() as connection:
+            await self._set_scope(connection, scope)
+            rows = await connection.execute(
+                text(
+                    """
+                    SELECT id FROM memory_event
+                    WHERE tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
+                      AND thread_id=:thread_id AND source='user'
+                      AND NOT prohibited_from_memory AND redacted_at IS NULL
+                      AND occurred_at <= now()
+                    ORDER BY occurred_at DESC, id DESC LIMIT 8
+                    """
+                ),
+                {**scope.model_dump(), "thread_id": thread_id},
+            )
+            return [str(event_id) for event_id in rows.scalars()]
+
+    @staticmethod
+    def background_source_digest(event_ids: Sequence[str]) -> str:
+        canonical_ids = sorted({str(UUID(event_id)) for event_id in event_ids})
+        if not 2 <= len(canonical_ids) <= 8:
+            raise ValueError("consolidation requires two to eight distinct events")
+        return hashlib.sha256(",".join(canonical_ids).encode()).hexdigest()
+
+    async def list_background_consolidation_drafts(
+        self, scope: MemoryScope, *, cursor: str = "", limit: int = 20,
+    ) -> BackgroundConsolidationDraftPage:
+        async with self.engine.begin() as connection:
+            await self._set_scope(connection, scope)
+            result = await connection.execute(
+                text("""
+                    SELECT source_digest, drafts FROM memory_consolidation_run
+                    WHERE tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
+                      AND drafts <> '[]'::jsonb
+                      AND source_digest > :cursor
+                    ORDER BY source_digest LIMIT :limit
+                """),
+                {**scope.model_dump(), "cursor": cursor, "limit": limit + 1},
+            )
+            rows = result.mappings().all()
+            return BackgroundConsolidationDraftPage(
+                batches=[BackgroundConsolidationDraftBatch.model_validate(row) for row in rows[:limit]],
+                next_cursor=rows[limit - 1]["source_digest"] if len(rows) > limit else None,
+            )
+
+    async def dismiss_background_consolidation_drafts(
+        self, scope: MemoryScope, source_digest: str,
+    ) -> None:
+        async with self.engine.begin() as connection:
+            await self._set_scope(connection, scope)
+            await connection.execute(
+                text("""
+                    UPDATE memory_consolidation_run SET drafts='[]'::jsonb
+                    WHERE tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
+                      AND source_digest=:digest AND drafts <> '[]'::jsonb
+                """),
+                {**scope.model_dump(), "digest": source_digest},
+            )
+
+    async def background_consolidation_completed(
+        self, scope: MemoryScope, event_ids: Sequence[str]
+    ) -> bool:
+        async with self.engine.connect() as connection:
+            result = await connection.execute(
+                text("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM memory_consolidation_run
+                        WHERE tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
+                          AND source_digest=:digest AND retry_at IS NULL
+                    )
+                """),
+                {**scope.model_dump(), "digest": self.background_source_digest(event_ids)},
+            )
+            return result.scalar_one()
+
+    async def complete_background_consolidation(
+        self, scope: MemoryScope, event_ids: Sequence[str],
+        *, drafts: Sequence[MemoryCandidate] = (), retry: bool = False,
+    ) -> bool:
+        digest = self.background_source_digest(event_ids)
+        ids = sorted({UUID(event_id) for event_id in event_ids})
+        if len(drafts) > 3 or any(
+            not 2 <= len(set(draft.source_event_ids)) <= len(ids)
+            or not set(draft.source_event_ids).issubset(str(event_id) for event_id in ids)
+            or draft.proposed_layer not in (MemoryLayer.EPISODIC, MemoryLayer.PROCEDURAL)
+            for draft in drafts
+        ):
+            raise ValueError("invalid background consolidation drafts")
+        async with self.engine.begin() as connection:
+            result = await connection.execute(
+                text(f"""
+                    INSERT INTO memory_consolidation_run
+                        (tenant_id, user_id, agent_id, source_digest, drafts, source_ids, retry_at)
+                    SELECT :tenant_id, :user_id, :agent_id, :digest, CAST(:drafts AS jsonb),
+                           CAST(:ids AS uuid[]),
+                           CASE WHEN :retry THEN now() + interval '10 minutes' END
+                    WHERE :source_count = (
+                        SELECT count(*) FROM (
+                            SELECT e.id
+                            {_BACKGROUND_CONSOLIDATION_EVENTS}
+                              AND e.tenant_id=:tenant_id AND e.user_id=:user_id
+                              AND e.agent_id=:agent_id AND e.id=ANY(CAST(:ids AS uuid[]))
+                            ORDER BY e.id FOR UPDATE OF e FOR KEY SHARE OF consent
+                        ) eligible
+                    )
+                    ON CONFLICT (tenant_id, user_id, agent_id, source_digest) DO UPDATE
+                    SET drafts=EXCLUDED.drafts, retry_at=EXCLUDED.retry_at
+                    WHERE memory_consolidation_run.retry_at IS NOT NULL
+                    RETURNING source_digest
+                """),
+                {
+                    **scope.model_dump(), "digest": digest, "ids": ids, "source_count": len(ids),
+                    "drafts": json.dumps([draft.model_dump(mode="json") for draft in drafts]),
+                    "retry": retry,
+                },
+            )
+            return result.scalar_one_or_none() is not None
+
+    async def consolidation_events(
+        self, scope: MemoryScope, event_ids: list[str], *, background: bool = False
+    ) -> list[tuple[str, InteractionEvent]]:
+        ids = sorted(set(event_ids))
+        if not 2 <= len(ids) <= 8:
+            raise ValueError("consolidation requires two to eight distinct events")
+        async with self.engine.begin() as connection:
+            await self._set_scope(connection, scope)
+            rows = await connection.execute(
+                text(
+                    """
+                    SELECT id, tenant_id, user_id, agent_id, thread_id, idempotency_key,
+                           source, content, occurred_at, occurred_utc_offset_seconds, metadata, ciphertext
+                    FROM memory_event
+                    WHERE id=ANY(CAST(:ids AS uuid[]))
+                      AND tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
+                      AND source='user' AND prohibited_from_memory=false AND redacted_at IS NULL
+                      AND occurred_at <= now()
+                      AND (NOT :background OR EXISTS (
+                          SELECT 1 FROM memory_consolidation_opt_in consent
+                          WHERE consent.tenant_id=memory_event.tenant_id
+                            AND consent.user_id=memory_event.user_id
+                            AND consent.agent_id=memory_event.agent_id
+                            AND consent.enabled_at <= memory_event.background_eligible_at
+                      ))
+                    ORDER BY occurred_at, id
+                    """
+                ),
+                {"ids": ids, "background": background, **scope.model_dump()},
+            )
+            events = [
+                (str(row["id"]), InteractionEvent.model_validate(
+                    self._event_payload(str(row["id"]), row)
+                ))
+                for row in rows.mappings()
+            ]
+        if len(events) != len(ids):
+            raise NotFoundError("consolidation sources")
+        return events
+
     async def record_event(self, event: InteractionEvent) -> RecordReceipt:
         canonical_payload = json.dumps(
             {
@@ -203,11 +529,16 @@ class PostgresRepository:
         payload_hash = hashlib.sha256(canonical_payload.encode()).hexdigest()
         event_id = str(uuid4())
         opted_out = explicitly_opts_out(event)
+        extraction_allowed = (
+            event.source is EventSource.USER and event.allow_memory_extraction and not opted_out
+        )
         params = {
             **event.model_dump(mode="json"),
             "id": event_id,
             "payload_hash": payload_hash,
             "opted_out": opted_out,
+            "extraction_allowed": extraction_allowed,
+            "utc_offset": int(event.occurred_at.utcoffset().total_seconds()),
             "metadata": json.dumps(event.metadata, ensure_ascii=False),
             "ciphertext": None,
             "ciphertext_key_id": None,
@@ -226,12 +557,13 @@ class PostgresRepository:
                     """
                     INSERT INTO memory_event (
                         id, tenant_id, user_id, agent_id, thread_id, idempotency_key,
-                        payload_hash, source, content, occurred_at, metadata,
-                        ciphertext, ciphertext_key_id, prohibited_from_memory
+                        payload_hash, source, content, occurred_at, occurred_utc_offset_seconds, metadata,
+                        ciphertext, ciphertext_key_id, prohibited_from_memory, background_eligible_at
                     ) VALUES (
                         :id, :tenant_id, :user_id, :agent_id, :thread_id, :idempotency_key,
-                        :payload_hash, :source, :content, :occurred_at, CAST(:metadata AS jsonb),
-                        :ciphertext, :ciphertext_key_id, :opted_out
+                        :payload_hash, :source, :content, :occurred_at, :utc_offset, CAST(:metadata AS jsonb),
+                        :ciphertext, :ciphertext_key_id, :opted_out,
+                        CASE WHEN :extraction_allowed THEN clock_timestamp() END
                     )
                     ON CONFLICT (tenant_id, user_id, agent_id, idempotency_key) DO NOTHING
                     RETURNING id
@@ -248,7 +580,7 @@ class PostgresRepository:
                     self.event_write_limit_per_minute,
                 )
                 extraction_status = "not_applicable"
-                if event.source is EventSource.USER and event.allow_memory_extraction and not opted_out:
+                if extraction_allowed:
                     await connection.execute(
                         text(
                             """
@@ -367,17 +699,23 @@ class PostgresRepository:
                 text(
                     """
                     SELECT tenant_id, user_id, agent_id, thread_id, idempotency_key,
-                           source, content, occurred_at, metadata, ciphertext
+                           source, content, occurred_at, occurred_utc_offset_seconds, metadata, ciphertext,
+                           prohibited_from_memory, redacted_at
                     FROM memory_event WHERE id=:event_id
                     """
                 ),
                 {"event_id": job["event_id"]},
             )
             event = result.mappings().one()
+        if event["prohibited_from_memory"] or event["redacted_at"] is not None:
+            await self.fail_extraction(
+                job["id"], job["attempts"], "source_unavailable", terminal=True
+            )
+            return None
         event_id = str(job["event_id"])
         try:
             payload = InteractionEvent.model_validate(self._event_payload(event_id, event))
-        except (InvalidTag, ValueError):
+        except (EventPayloadUnreadable, ValueError):
             await self.fail_extraction(job["id"], job["attempts"], "EventPayloadUnreadable")
             raise EventPayloadUnreadable("could not decode extraction event") from None
         return EventJob(
@@ -386,11 +724,19 @@ class PostgresRepository:
 
     def _event_payload(self, event_id: str, row: Any) -> dict[str, Any]:
         payload = dict(row)
+        utc_offset = payload.pop("occurred_utc_offset_seconds", None)
+        if utc_offset is not None:
+            payload["occurred_at"] = payload["occurred_at"].astimezone(
+                timezone(timedelta(seconds=utc_offset))
+            )
         ciphertext = payload.pop("ciphertext")
         if ciphertext is not None:
             if self.event_cipher is None:
-                raise ValueError("event encryption key is required to read this event")
-            payload.update(self.event_cipher.decrypt(event_id, ciphertext))
+                raise EventPayloadUnreadable("event encryption key is unavailable")
+            try:
+                payload.update(self.event_cipher.decrypt(event_id, ciphertext))
+            except (InvalidTag, ValueError):
+                raise EventPayloadUnreadable("could not decode event payload") from None
         return payload
 
     async def store_candidates(
@@ -407,12 +753,13 @@ class PostgresRepository:
         scope = event_scope(event)
         stored: list[str] = []
         stored_by_fingerprint: dict[tuple[MemoryLayer, str], str] = {}
+        rejected_fingerprints: set[tuple[MemoryLayer, str]] = set()
         async with self.engine.begin() as connection:
             await self._set_scope(connection, scope)
             source = await connection.execute(
                 text(
                     """
-                    SELECT prohibited_from_memory FROM memory_event
+                    SELECT prohibited_from_memory, redacted_at, occurred_at FROM memory_event
                     WHERE id=:event_id AND tenant_id=:tenant_id AND user_id=:user_id
                       AND agent_id=:agent_id
                     FOR UPDATE
@@ -421,7 +768,10 @@ class PostgresRepository:
                 {"event_id": event_id, **scope.model_dump()},
             )
             source_row = source.mappings().first()
-            if source_row is None or source_row["prohibited_from_memory"]:
+            if (
+                source_row is None or source_row["prohibited_from_memory"]
+                or source_row["redacted_at"] is not None
+            ):
                 return []
             if job is not None:
                 lease = await connection.execute(
@@ -433,22 +783,29 @@ class PostgresRepository:
                 )
                 if lease.first() is None:
                     return []
+            conflict_subjects = {
+                candidate.subject_key
+                for candidate in candidates
+                if candidate.subject_key and candidate.valid_to is None
+            } if status == "active" and event.source is EventSource.USER else set()
+            # Model output order varies across workers; acquire subject locks before writing rows.
+            for subject_key in sorted(conflict_subjects):
+                await self._lock_subject(connection, scope, subject_key)
             for candidate in candidates:
                 conflict_eligible = (
-                    status == "active"
-                    and event.source is EventSource.USER
-                    and bool(candidate.subject_key)
-                    and candidate.valid_to is None
+                    candidate.subject_key in conflict_subjects and candidate.valid_to is None
                 )
-                if conflict_eligible:
-                    await self._lock_subject(connection, scope, candidate.subject_key or "")
                 fingerprint = hashlib.sha256(
                     f"{candidate.kind}\0{' '.join(candidate.statement.lower().split())}".encode()
                 ).hexdigest()
                 memory_id = str(uuid4())
-                affect = (
-                    candidate.affect.model_dump_json() if candidate.affect is not None else None
-                )
+                observation = candidate.affect
+                if (
+                    candidate.proposed_layer is not MemoryLayer.WORKING
+                    or (observation and observation.observed_at != source_row["occurred_at"])
+                ):
+                    observation = None
+                affect = observation.model_dump_json() if observation is not None else None
                 row = await connection.execute(
                     text(
                         """
@@ -472,14 +829,26 @@ class PostgresRepository:
                             status=CASE
                                 WHEN memory_item.status='quarantined'
                                   AND EXCLUDED.status='active' THEN 'active'
+                                WHEN memory_item.layer='L1' AND memory_item.status='expired'
+                                  AND EXCLUDED.status='active'
+                                  AND EXCLUDED.expires_at > now() THEN 'active'
                                 ELSE memory_item.status
                             END,
                             subject_key=COALESCE(memory_item.subject_key, EXCLUDED.subject_key),
+                            affect=CASE
+                                WHEN memory_item.layer='L1' AND EXCLUDED.affect IS NOT NULL
+                                  AND (
+                                    memory_item.affect IS NULL
+                                    OR (EXCLUDED.affect->>'observed_at')::timestamptz
+                                       >= (memory_item.affect->>'observed_at')::timestamptz
+                                  ) THEN EXCLUDED.affect
+                                ELSE memory_item.affect
+                            END,
                             sensitivity=EXCLUDED.sensitivity,
                             poisoning_flags=EXCLUDED.poisoning_flags,
                             updated_at=now()
-                        WHERE memory_item.status <> 'deleting'
-                        RETURNING id
+                        WHERE memory_item.status NOT IN ('deleting','rejected')
+                        RETURNING id, status
                         """
                     ),
                     {
@@ -503,11 +872,26 @@ class PostgresRepository:
                         **scope.model_dump(),
                     },
                 )
-                returned_id = row.scalar_one_or_none()
-                if returned_id is None:
+                item = row.mappings().one_or_none()
+                key = (candidate.proposed_layer, fingerprint)
+                if item is None:
+                    existing = await connection.execute(
+                        text(
+                            """
+                            SELECT status FROM memory_item
+                            WHERE tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
+                              AND layer=:layer AND fingerprint=:fingerprint
+                            """
+                        ),
+                        {**scope.model_dump(), "layer": candidate.proposed_layer.value,
+                         "fingerprint": fingerprint},
+                    )
+                    if existing.scalar_one_or_none() == "rejected":
+                        rejected_fingerprints.add(key)
+                        continue
                     raise MemoryDeletionInProgress()
-                stored_id = str(returned_id)
-                stored_by_fingerprint[(candidate.proposed_layer, fingerprint)] = stored_id
+                stored_id = str(item["id"])
+                stored_by_fingerprint[key] = stored_id
                 await connection.execute(
                     text(
                         """
@@ -519,7 +903,25 @@ class PostgresRepository:
                     {"memory_id": stored_id, "event_id": event_id},
                 )
                 await self._audit(connection, scope, "automatic_memory", stored_id)
-                if conflict_eligible and await self._link_unresolved_conflicts(
+                if observation is not None:
+                    await connection.execute(
+                        text(
+                            """
+                            INSERT INTO memory_affect_observation (
+                                memory_id, event_id, affect, observed_at, expires_at
+                            ) VALUES (:memory_id, :event_id, CAST(:affect AS jsonb),
+                                      :observed_at, :expires_at)
+                            ON CONFLICT DO NOTHING
+                            """
+                        ),
+                        {
+                            "memory_id": stored_id, "event_id": event_id,
+                            "affect": affect,
+                            "observed_at": observation.observed_at,
+                            "expires_at": candidate.expires_at,
+                        },
+                    )
+                if conflict_eligible and item["status"] == "active" and await self._link_unresolved_conflicts(
                     connection,
                     scope,
                     stored_id,
@@ -535,6 +937,11 @@ class PostgresRepository:
                 fingerprint = hashlib.sha256(
                     f"{candidate.kind}\0{' '.join(candidate.statement.lower().split())}".encode()
                 ).hexdigest()
+                key = (candidate.proposed_layer, fingerprint)
+                outcome = candidate_decision.outcome
+                reason = candidate_decision.reason
+                if key in rejected_fingerprints and outcome != "rejected":
+                    outcome, reason = "rejected", "previously_rejected"
                 await connection.execute(
                     text(
                         """
@@ -556,21 +963,20 @@ class PostgresRepository:
                         "id": str(uuid4()),
                         "event_id": event_id,
                         "candidate_ordinal": ordinal,
-                        "kind": "redacted" if candidate_decision.outcome == "rejected" else candidate.kind,
+                        "kind": "redacted" if outcome == "rejected" else candidate.kind,
                         "proposed_layer": candidate.proposed_layer.value,
                         "subject_key": (
-                            None if candidate_decision.outcome == "rejected" else candidate.subject_key
+                            None if outcome == "rejected" else candidate.subject_key
                         ),
                         "sensitivity": candidate.sensitivity,
                         "poisoning_flags": (
-                            [] if candidate_decision.outcome == "rejected" else candidate.poisoning_flags
+                            [] if outcome == "rejected" else candidate.poisoning_flags
                         ),
-                        "outcome": candidate_decision.outcome,
-                        "reason": candidate_decision.reason,
+                        "outcome": outcome,
+                        "reason": reason,
                         "policy_version": policy_version,
                         "stored_memory_id": (
-                            None if candidate_decision.outcome == "rejected"
-                            else stored_by_fingerprint.get((candidate.proposed_layer, fingerprint))
+                            None if outcome == "rejected" else stored_by_fingerprint.get(key)
                         ),
                         **scope.model_dump(),
                     },
@@ -616,6 +1022,8 @@ class PostgresRepository:
         key: str,
         payload_hash: str,
         policy_version: str,
+        *,
+        background_draft: tuple[str, int, MemoryCandidate] | None = None,
     ) -> CommandReceipt:
         scope = command.scope
         async with self.engine.begin() as connection:
@@ -659,31 +1067,87 @@ class PostgresRepository:
                     self.command_write_limit_per_minute,
                 )
             command_id = str(uuid4())
-            if isinstance(command, RememberCommand):
-                memory_id = await self._remember(
-                    connection,
-                    scope,
-                    command.statement,
-                    command.source_event_id,
-                    policy_version,
-                )
-                receipt = CommandReceipt(
-                    command_id=command_id,
-                    status="completed",
-                    affected_memory_ids=[memory_id],
-                )
-            elif isinstance(command, RememberProcedureCommand):
-                memory_id = await self._remember_explicit(
-                    connection,
-                    scope,
-                    command.statement,
-                    command.source_event_id,
-                    policy_version,
-                    layer="L4",
-                    kind="user_confirmed_procedure",
-                    audit_action="remember_procedure",
-                    require_user_source=True,
-                )
+            if isinstance(command, RememberCommand | RememberProcedureCommand):
+                supporting_ids = sorted({str(UUID(value)) for value in command.supporting_event_ids})
+                if supporting_ids:
+                    confirmation_id = str(UUID(command.source_event_id))
+                    if confirmation_id in supporting_ids:
+                        raise NotFoundError(command.source_event_id)
+                    all_ids = sorted([*supporting_ids, confirmation_id])
+                    evidence = await connection.execute(
+                        text(
+                            """
+                            SELECT id, source, content, ciphertext FROM memory_event
+                            WHERE id=ANY(CAST(:ids AS uuid[]))
+                              AND tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
+                              AND source='user' AND prohibited_from_memory=false
+                              AND redacted_at IS NULL
+                              AND occurred_at <= now()
+                            ORDER BY id FOR UPDATE
+                            """
+                        ),
+                        {"ids": all_ids, **scope.model_dump()},
+                    )
+                    rows = list(evidence.mappings())
+                    if len(rows) != len(all_ids) or any(
+                        is_memory_opt_out(
+                            row["source"], self._event_payload(str(row["id"]), row)["content"]
+                        )
+                        for row in rows
+                    ):
+                        raise NotFoundError(command.source_event_id)
+                if background_draft is not None:
+                    digest, ordinal, draft = background_draft
+                    dismissed = await connection.execute(
+                        text("""
+                            UPDATE memory_consolidation_run SET drafts='[]'::jsonb
+                            WHERE tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
+                              AND source_digest=:digest
+                              AND drafts -> CAST(:ordinal AS integer) = CAST(:draft AS jsonb)
+                            RETURNING source_digest
+                        """),
+                        {
+                            **scope.model_dump(), "digest": digest, "ordinal": ordinal,
+                            "draft": draft.model_dump_json(),
+                        },
+                    )
+                    if dismissed.scalar_one_or_none() is None:
+                        raise NotFoundError(digest)
+                if isinstance(command, RememberProcedureCommand):
+                    memory_id = await self._remember_explicit(
+                        connection, scope, command.statement, command.source_event_id, policy_version,
+                        layer="L4", kind="user_confirmed_procedure", audit_action="remember_procedure",
+                        require_user_source=True,
+                    )
+                elif command.expires_at is None:
+                    memory_id = await self._remember(
+                        connection, scope, command.statement, command.source_event_id, policy_version
+                    )
+                else:
+                    valid = await connection.execute(
+                        text(
+                            "SELECT CAST(:expiry AS timestamptz) > now() "
+                            "AND CAST(:expiry AS timestamptz) <= now() + interval '180 days'"
+                        ),
+                        {"expiry": command.expires_at},
+                    )
+                    if not valid.scalar_one():
+                        raise InvalidMemoryExpiry()
+                    memory_id = await self._remember_explicit(
+                        connection, scope, command.statement, command.source_event_id, policy_version,
+                        layer="L2", kind="explicit_episode", audit_action="remember",
+                        require_user_source=True, expires_at=command.expires_at,
+                    )
+                for event_id in supporting_ids:
+                    await self._add_evidence(connection, memory_id, event_id)
+                if supporting_ids:
+                    await connection.execute(
+                        text(
+                            "INSERT INTO memory_dependency (memory_id, event_id) "
+                            "VALUES (:memory_id, :event_id) ON CONFLICT DO NOTHING"
+                        ),
+                        [{"memory_id": memory_id, "event_id": event_id} for event_id in all_ids],
+                    )
                 receipt = CommandReceipt(
                     command_id=command_id,
                     status="completed",
@@ -804,17 +1268,20 @@ class PostgresRepository:
         kind: str,
         audit_action: str,
         require_user_source: bool,
+        expires_at: datetime | None = None,
     ) -> str:
         memory_id = str(uuid4())
-        fingerprint = hashlib.sha256(
-            f"{kind}\0{' '.join(statement.lower().split())}".encode()
-        ).hexdigest()
+        identity = f"{kind}\0{' '.join(statement.lower().split())}"
+        if expires_at is not None:
+            identity += f"\0{expires_at.astimezone(UTC).isoformat()}"
+        fingerprint = hashlib.sha256(identity.encode()).hexdigest()
         event = await connection.execute(
             text(
                 """
                 SELECT source, content, ciphertext FROM memory_event
                 WHERE id=:event_id AND tenant_id=:tenant_id AND user_id=:user_id
                   AND agent_id=:agent_id AND prohibited_from_memory=false
+                  AND redacted_at IS NULL
                   AND (:require_user_source=false OR source='user')
                 FOR UPDATE
                 """
@@ -835,11 +1302,11 @@ class PostgresRepository:
                 INSERT INTO memory_item (
                     id, tenant_id, user_id, agent_id, statement, layer, kind,
                     status, confidence, policy_version, valid_from, fingerprint,
-                    future_utility, durability
+                    future_utility, durability, expires_at
                 ) VALUES (
                     :id, :tenant_id, :user_id, :agent_id, :statement, :layer,
                     :kind, 'active', 1.0, :policy_version, now(), :fingerprint,
-                    'high', 'stable'
+                    'high', CASE WHEN :layer='L2' THEN 'uncertain' ELSE 'stable' END, :expires_at
                 )
                 ON CONFLICT (tenant_id, user_id, agent_id, layer, fingerprint)
                 WHERE fingerprint IS NOT NULL
@@ -864,6 +1331,7 @@ class PostgresRepository:
                 "kind": kind,
                 "policy_version": policy_version,
                 "fingerprint": fingerprint,
+                "expires_at": expires_at,
                 **scope.model_dump(),
             },
         )
@@ -913,10 +1381,39 @@ class PostgresRepository:
             "procedural": procedural,
             **scope.model_dump(),
         }
+        event = await connection.execute(
+            text(
+                """
+                SELECT id, source, content, ciphertext, prohibited_from_memory, redacted_at,
+                       id=:event_id AS is_correction
+                FROM memory_event
+                WHERE tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
+                  AND (id=:event_id OR id IN (
+                    SELECT event_id FROM memory_dependency WHERE memory_id=:memory_id
+                  ))
+                ORDER BY id
+                FOR UPDATE
+                """
+            ),
+            params,
+        )
+        rows = list(event.mappings())
+        row = next((candidate for candidate in rows if candidate["is_correction"]), None)
+        if (
+            row is None
+            or row["redacted_at"] is not None
+            or (procedural and row["source"] != "user")
+            or any(candidate["prohibited_from_memory"] for candidate in rows)
+        ):
+            raise NotFoundError(memory_id)
+        evidence = self._event_payload(source_event_id, row)
+        if is_memory_opt_out(evidence["source"], evidence["content"]):
+            raise NotFoundError(memory_id)
+        subject_key = await self._lock_memory_subject(connection, scope, memory_id)
         owned = await connection.execute(
             text(
                 """
-                SELECT id, subject_key, kind, layer FROM memory_item
+                SELECT id, subject_key, kind, layer, expires_at FROM memory_item
                 WHERE id=:memory_id AND tenant_id=:tenant_id AND user_id=:user_id
                   AND agent_id=:agent_id AND status='active'
                   AND ((:procedural=true AND layer='L4')
@@ -926,26 +1423,21 @@ class PostgresRepository:
             ),
             params,
         )
-        event = await connection.execute(
-            text(
-                """
-                SELECT source, content, ciphertext FROM memory_event
-                WHERE id=:event_id AND tenant_id=:tenant_id AND user_id=:user_id
-                  AND agent_id=:agent_id AND prohibited_from_memory=false
-                  AND (:procedural=false OR source='user')
-                """
-            ),
+        owned_row = owned.mappings().first()
+        if owned_row is None:
+            raise NotFoundError(memory_id)
+        if owned_row["subject_key"] != subject_key:
+            raise MemorySourcesChanged()
+        dependencies = await connection.execute(
+            text("SELECT event_id FROM memory_dependency WHERE memory_id=:memory_id"),
             params,
         )
-        owned_row = owned.mappings().first()
-        row = event.mappings().first()
-        evidence = self._event_payload(source_event_id, row) if row is not None else None
-        if (
-            owned_row is None
-            or evidence is None
-            or is_memory_opt_out(evidence["source"], evidence["content"])
-        ):
-            raise NotFoundError(memory_id)
+        source_ids = set(dependencies.scalars())
+        # A concurrent confirmation can add sources before we acquire the memory lock.
+        # Retry with a fresh snapshot rather than publishing with unlocked sources.
+        if not source_ids.issubset(candidate["id"] for candidate in rows):
+            raise MemorySourcesChanged()
+        is_summary = bool(source_ids)
         layer = owned_row["layer"]
         correction_kind = (
             "user_confirmed_procedure_correction"
@@ -953,14 +1445,14 @@ class PostgresRepository:
             else "explicit_correction"
         )
         audit_action = "correct_procedure" if procedural else "correct"
-        subject_key = owned_row["subject_key"]
-        if subject_key:
-            await self._lock_subject(connection, scope, subject_key)
         await connection.execute(
-            text("UPDATE memory_item SET status='superseded', valid_to=now() WHERE id=:memory_id"),
+            text(
+                "UPDATE memory_item SET status='superseded', valid_to=LEAST(valid_to, now()) "
+                "WHERE id=:memory_id"
+            ),
             params,
         )
-        if subject_key:
+        if subject_key and not is_summary:
             matching = await connection.execute(
                 text(
                     """
@@ -1009,11 +1501,12 @@ class PostgresRepository:
                 INSERT INTO memory_item (
                     id, tenant_id, user_id, agent_id, statement, layer, kind,
                     status, confidence, policy_version, valid_from, supersedes_id,
-                    subject_key, future_utility, durability
+                    subject_key, future_utility, durability, expires_at
                 ) VALUES (
                     :id, :tenant_id, :user_id, :agent_id, :statement, :layer,
                     :kind, 'active', 1.0, :policy_version, now(),
-                    :memory_id, :subject_key, 'high', 'stable'
+                    :memory_id, :subject_key, 'high',
+                    CASE WHEN :layer IN ('L1','L2') THEN 'uncertain' ELSE 'stable' END, :expires_at
                 )
                 """
             ),
@@ -1025,9 +1518,18 @@ class PostgresRepository:
                 "kind": correction_kind,
                 "policy_version": policy_version,
                 "subject_key": subject_key,
+                "expires_at": owned_row["expires_at"],
             },
         )
         await self._add_evidence(connection, replacement_id, source_event_id)
+        if is_summary:
+            for source in rows:
+                if not source["is_correction"]:
+                    await self._add_evidence(connection, replacement_id, str(source["id"]))
+            await connection.execute(
+                text("INSERT INTO memory_dependency (memory_id, event_id) VALUES (:memory_id, :id)"),
+                [{"memory_id": replacement_id, "id": source["id"]} for source in rows],
+            )
         if subject_key and await self._link_unresolved_conflicts(
             connection,
             scope,
@@ -1054,7 +1556,7 @@ class PostgresRepository:
         scope: MemoryScope,
         memory_ids: list[str],
     ) -> tuple[list[str], str | None]:
-        normalized = sorted(set(memory_ids))
+        normalized = sorted({str(UUID(value)) for value in memory_ids})
         await self._lock_deletion_target(connection, scope, "memory", normalized)
         existing = await self._find_or_retry_deletion_job(
             connection, scope, "memory_ids", normalized
@@ -1067,7 +1569,7 @@ class PostgresRepository:
                 SELECT id FROM memory_item
                 WHERE tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
                   AND id = ANY(CAST(:ids AS uuid[])) AND status <> 'deleting'
-                FOR UPDATE
+                ORDER BY id FOR UPDATE
                 """
             ),
             {**scope.model_dump(), "ids": normalized},
@@ -1105,7 +1607,7 @@ class PostgresRepository:
         scope: MemoryScope,
         event_ids: list[str],
     ) -> tuple[list[str], str | None]:
-        normalized = sorted(set(event_ids))
+        normalized = sorted({str(UUID(value)) for value in event_ids})
         await self._lock_deletion_target(connection, scope, "event", normalized)
         existing = await self._find_or_retry_deletion_job(
             connection, scope, "event_ids", normalized
@@ -1113,6 +1615,19 @@ class PostgresRepository:
         if existing is not None:
             return [str(value) for value in existing["memory_ids"]], str(existing["id"])
         params = {**scope.model_dump(), "ids": normalized}
+        owned = await connection.execute(
+            text(
+                """
+                SELECT id FROM memory_event
+                WHERE tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
+                  AND id=ANY(CAST(:ids AS uuid[]))
+                ORDER BY id FOR UPDATE
+                """
+            ),
+            params,
+        )
+        if {str(row[0]) for row in owned} != set(normalized):
+            raise NotFoundError("event scope invalid or forbidden")
         events = await connection.execute(
             text(
                 """
@@ -1144,9 +1659,15 @@ class PostgresRepository:
         evidence = await connection.execute(
             text(
                 """
-                DELETE FROM memory_evidence
+                WITH detached AS (
+                    DELETE FROM memory_evidence
+                    WHERE event_id = ANY(CAST(:ids AS uuid[]))
+                    RETURNING memory_id
+                )
+                SELECT memory_id FROM detached
+                UNION
+                SELECT memory_id FROM memory_dependency
                 WHERE event_id = ANY(CAST(:ids AS uuid[]))
-                RETURNING memory_id
                 """
             ),
             params,
@@ -1154,6 +1675,30 @@ class PostgresRepository:
         touched = sorted({str(row[0]) for row in evidence})
         affected: list[str] = []
         if touched:
+            await connection.execute(
+                text(
+                    """
+                    UPDATE memory_item m
+                    SET affect=(
+                        SELECT o.affect FROM memory_affect_observation o
+                        JOIN memory_event e ON e.id=o.event_id
+                        WHERE o.memory_id=m.id AND e.prohibited_from_memory=false
+                          AND (e.tenant_id,e.user_id,e.agent_id)=(m.tenant_id,m.user_id,m.agent_id)
+                        ORDER BY o.observed_at DESC, o.recorded_at DESC, o.event_id LIMIT 1
+                    ),
+                    expires_at=CASE WHEN m.layer='L1' THEN LEAST(m.expires_at, (
+                        SELECT max(o.expires_at) FROM memory_affect_observation o
+                        JOIN memory_event e ON e.id=o.event_id
+                        WHERE o.memory_id=m.id AND e.prohibited_from_memory=false
+                          AND (e.tenant_id,e.user_id,e.agent_id)=(m.tenant_id,m.user_id,m.agent_id)
+                    )) ELSE m.expires_at END
+                    WHERE m.id=ANY(CAST(:memory_ids AS uuid[]))
+                      AND m.tenant_id=:tenant_id AND m.user_id=:user_id AND m.agent_id=:agent_id
+                      AND m.affect IS NOT NULL
+                    """
+                ),
+                {**scope.model_dump(), "memory_ids": touched},
+            )
             memories = await connection.execute(
                 text(
                     """
@@ -1161,13 +1706,17 @@ class PostgresRepository:
                     WHERE m.tenant_id=:tenant_id AND m.user_id=:user_id
                       AND m.agent_id=:agent_id
                       AND m.id = ANY(CAST(:memory_ids AS uuid[]))
-                      AND NOT EXISTS (
+                      AND (NOT EXISTS (
                           SELECT 1 FROM memory_evidence e WHERE e.memory_id=m.id
-                      )
+                      ) OR EXISTS (
+                          SELECT 1 FROM memory_dependency dependency
+                          WHERE dependency.memory_id=m.id
+                            AND dependency.event_id=ANY(CAST(:ids AS uuid[]))
+                      ))
                     RETURNING m.id
                     """
                 ),
-                {**scope.model_dump(), "memory_ids": touched},
+                {**params, "memory_ids": touched},
             )
             affected = [str(row[0]) for row in memories]
         job_id = await self._create_deletion_job(
@@ -1193,14 +1742,29 @@ class PostgresRepository:
                 text(
                     """
                     WITH eligible AS (
-                        SELECT m.*
+                        SELECT m.*, observation.affect AS observed_affect,
+                               observation.observed_at, observation.expires_at AS observed_expiry
                         FROM memory_item m
+                        LEFT JOIN LATERAL (
+                            SELECT o.affect, o.observed_at, o.expires_at
+                            FROM memory_affect_observation o
+                            JOIN memory_event e ON e.id=o.event_id
+                            WHERE o.memory_id=m.id AND m.layer='L1'
+                              AND (e.tenant_id,e.user_id,e.agent_id)=(m.tenant_id,m.user_id,m.agent_id)
+                              AND o.observed_at<=:now AND o.recorded_at<=:now
+                              AND e.occurred_at<=:now AND e.recorded_at<=:now
+                              AND e.prohibited_from_memory=false
+                            ORDER BY o.observed_at DESC, o.recorded_at DESC, o.event_id LIMIT 1
+                        ) observation ON true
                         WHERE m.tenant_id=:tenant_id AND m.user_id=:user_id
                           AND m.agent_id=:agent_id
                           AND m.created_at <= :now
+                          AND cardinality(m.poisoning_flags)=0
+                          AND m.sensitivity NOT IN ('high','secret')
                           AND (
                             m.status='active'
                             OR (:purpose='history' AND m.status IN ('superseded','archived'))
+                            OR (:purpose='history' AND m.layer='L1' AND m.status='expired')
                           )
                           AND (
                             :purpose='history'
@@ -1211,8 +1775,8 @@ class PostgresRepository:
                           )
                           AND (
                             :purpose='history'
-                            OR m.expires_at IS NULL
-                            OR m.expires_at > :now
+                            OR COALESCE(observation.expires_at, m.expires_at) IS NULL
+                            OR COALESCE(observation.expires_at, m.expires_at) > :now
                           )
                     ),
                     lexical AS (
@@ -1256,11 +1820,25 @@ class PostgresRepository:
                         LIMIT 20
                     ),
                     purpose_context AS (
-                        SELECT id, row_number() OVER (ORDER BY updated_at DESC, id) AS position
-                        FROM eligible
-                        WHERE (layer='L1' AND :purpose='support')
-                           OR (layer='L3' AND :purpose='history')
-                        ORDER BY updated_at DESC, id
+                        SELECT id, row_number() OVER (
+                            ORDER BY affect_priority DESC, updated_at DESC, id
+                        ) AS position
+                        FROM (
+                            SELECT id, updated_at, CASE WHEN :purpose='support' THEN
+                                COALESCE(
+                                    (observed_affect->>'arousal')::double precision
+                                    * (observed_affect->>'confidence')::double precision
+                                    * power(0.5, extract(epoch FROM (
+                                        CAST(:now AS timestamptz) - observed_at
+                                    )) / 21600.0),
+                                    0
+                                )
+                                ELSE 0 END AS affect_priority
+                            FROM eligible
+                            WHERE (layer='L1' AND :purpose='support')
+                               OR (layer='L3' AND :purpose='history')
+                        ) ranked_context
+                        ORDER BY affect_priority DESC, updated_at DESC, id
                         LIMIT 20
                     ),
                     semantic_scores AS (
@@ -1299,7 +1877,12 @@ class PostgresRepository:
                         FROM ranked GROUP BY id
                     )
                     SELECT m.id, m.statement, m.layer, m.valid_from, m.valid_to,
-                           m.confidence,
+                           m.confidence, COALESCE(state.observed_expiry, m.expires_at) AS expires_at,
+                           CASE WHEN m.layer='L1' AND :purpose IN ('support','history') THEN
+                               COALESCE(state.observed_affect,
+                                   CASE WHEN (m.affect->>'observed_at')::timestamptz <= :now
+                                        THEN m.affect END)
+                           END AS affect,
                            COALESCE(array_agg(e.event_id::text)
                              FILTER (WHERE e.event_id IS NOT NULL), '{}') AS event_ids,
                            COALESCE(c.conflict_ids, '{}') AS conflict_ids,
@@ -1309,16 +1892,57 @@ class PostgresRepository:
                             AND m.subject_key IS DISTINCT FROM :query
                             AND cardinality(COALESCE(c.conflict_ids, '{}'))=0) AS rerank_eligible,
                            f.rrf_score
-                           + CASE m.future_utility
+                           + (CASE m.future_utility
                                WHEN 'high' THEN 0.20
                                WHEN 'medium' THEN 0.08
                                ELSE 0
                              END
+                             + CASE WHEN :purpose='support' AND m.layer='L1' THEN
+                                 0.08 * COALESCE(
+                                   (state.observed_affect->>'arousal')::double precision, 0
+                                 ) * COALESCE(
+                                   (state.observed_affect->>'confidence')::double precision, 0
+                                 )
+                               ELSE 0 END)
+                             * CASE
+                                 WHEN :purpose='history' OR m.layer NOT IN ('L1','L2') THEN 1
+                                 ELSE power(
+                                   0.5,
+                                   GREATEST(0, extract(epoch FROM (
+                                     CAST(:now AS timestamptz)
+                                     - COALESCE(state.observed_at, CASE
+                                         WHEN m.layer='L1'
+                                           AND (m.affect->>'observed_at')::timestamptz <= :now
+                                         THEN (m.affect->>'observed_at')::timestamptz
+                                         ELSE COALESCE(m.valid_from, m.created_at)
+                                       END)
+                                   ))) / CASE WHEN m.layer='L1' THEN 21600.0 ELSE 2592000.0 END
+                                 )
+                               END
                            - CASE WHEN cardinality(c.conflict_ids) > 0 THEN 0.12 ELSE 0 END
+                           + CASE WHEN :purpose IN ('conversation','task')
+                                  AND f.query_matched AND m.sensitivity='low'
+                                  AND cardinality(m.poisoning_flags)=0
+                                  AND m.last_reinforced_at<=:now
+                                  AND COALESCE(cardinality(c.conflict_ids), 0)=0
+                             THEN 0.02 * power(
+                                 0.5, extract(epoch FROM (
+                                     CAST(:now AS timestamptz)-m.last_reinforced_at
+                                 )) / 604800.0
+                             )
+                             ELSE 0 END
                            AS rank
                     FROM memory_item m
                     JOIN fused f ON f.id=m.id
+                    JOIN eligible state ON state.id=m.id
                     LEFT JOIN memory_evidence e ON e.memory_id=m.id
+                      AND EXISTS (
+                        SELECT 1 FROM memory_event evidence_event
+                        WHERE evidence_event.id=e.event_id
+                          AND evidence_event.occurred_at <= :now
+                          AND evidence_event.recorded_at <= :now
+                          AND NOT evidence_event.prohibited_from_memory
+                      )
                     LEFT JOIN LATERAL (
                         SELECT array_agg(
                             CASE WHEN r.from_memory_id=m.id
@@ -1327,24 +1951,18 @@ class PostgresRepository:
                             ORDER BY r.created_at
                         ) AS conflict_ids
                         FROM memory_relation r
-                        JOIN memory_item other ON other.id=CASE
+                        JOIN eligible other ON other.id=CASE
                             WHEN r.from_memory_id=m.id THEN r.to_memory_id
                             ELSE r.from_memory_id
                         END
                         WHERE r.relation='contradicts'
+                          AND (r.resolved_at IS NULL OR r.resolved_at > :now)
                           AND (r.from_memory_id=m.id OR r.to_memory_id=m.id)
                           AND other.status='active'
-                          AND r.created_at <= :now AND other.created_at <= :now
-                          AND (
-                            :purpose='history'
-                            OR (
-                              (other.valid_from IS NULL OR other.valid_from <= :now)
-                              AND (other.valid_to IS NULL OR other.valid_to > :now)
-                              AND (other.expires_at IS NULL OR other.expires_at > :now)
-                            )
-                          )
+                          AND r.created_at <= :now
                     ) c ON true
-                    GROUP BY m.id, f.rrf_score, f.query_matched, c.conflict_ids
+                    GROUP BY m.id, f.rrf_score, f.query_matched, c.conflict_ids,
+                             state.observed_affect, state.observed_at, state.observed_expiry
                     ORDER BY (m.subject_key IS NOT DISTINCT FROM :query) DESC,
                              f.query_matched DESC,
                              (char_length(:query) >= 3 AND strpos(m.statement, :query) > 0) DESC,
@@ -1377,12 +1995,20 @@ class PostgresRepository:
                 text(
                     """
                     SELECT m.id, m.statement, m.layer, m.valid_from, m.valid_to,
-                           m.confidence,
+                           m.confidence, m.expires_at,
+                           NULL::jsonb AS affect,
                            COALESCE(array_agg(e.event_id::text)
                              FILTER (WHERE e.event_id IS NOT NULL), '{}') AS event_ids,
                            ARRAY[]::text[] AS conflict_ids
                     FROM memory_item m
                     LEFT JOIN memory_evidence e ON e.memory_id=m.id
+                      AND EXISTS (
+                        SELECT 1 FROM memory_event evidence_event
+                        WHERE evidence_event.id=e.event_id
+                          AND evidence_event.occurred_at <= :now
+                          AND evidence_event.recorded_at <= :now
+                          AND NOT evidence_event.prohibited_from_memory
+                      )
                     WHERE m.tenant_id=:tenant_id AND m.user_id=:user_id
                       AND m.agent_id=:agent_id
                       AND m.status='active' AND m.layer='L3'
@@ -1414,6 +2040,7 @@ class PostgresRepository:
                           ELSE r.from_memory_id
                         END
                         WHERE r.relation='contradicts'
+                          AND (r.resolved_at IS NULL OR r.resolved_at > :now)
                           AND (r.from_memory_id=m.id OR r.to_memory_id=m.id)
                           AND other.status='active'
                           AND r.created_at <= :now AND other.created_at <= :now
@@ -1454,13 +2081,18 @@ class PostgresRepository:
         sql = f"""
             SELECT m.id, m.statement, m.layer, m.status, m.valid_from, m.valid_to,
                    m.expires_at, m.kind, m.confidence, m.future_utility,
-                   m.affect, m.policy_version, m.subject_key, m.sensitivity,
+                   CASE WHEN m.layer='L1' THEN m.affect END AS affect,
+                   m.policy_version, m.subject_key, m.sensitivity,
                    m.poisoning_flags,
                    COALESCE(c.conflict_ids, '{{}}') AS conflict_ids,
                    COALESCE(array_agg(e.event_id::text)
                      FILTER (WHERE e.event_id IS NOT NULL), '{{}}') AS event_ids
             FROM memory_item m
             LEFT JOIN memory_evidence e ON e.memory_id=m.id
+              AND EXISTS (
+                SELECT 1 FROM memory_event evidence_event
+                WHERE evidence_event.id=e.event_id AND NOT evidence_event.prohibited_from_memory
+              )
             LEFT JOIN LATERAL (
                 SELECT array_agg(
                     CASE WHEN r.from_memory_id=m.id
@@ -1474,6 +2106,7 @@ class PostgresRepository:
                     ELSE r.from_memory_id
                 END
                 WHERE r.relation='contradicts'
+                  AND r.resolved_at IS NULL
                   AND (r.from_memory_id=m.id OR r.to_memory_id=m.id)
                   AND other.status='active'
             ) c ON true
@@ -1533,6 +2166,36 @@ class PostgresRepository:
                 created_at=result["created_at"],
                 completed_at=result["completed_at"],
             )
+
+    async def affect_history(
+        self, scope: MemoryScope, memory_id: str, limit: int, as_of: datetime | None = None
+    ) -> list[AffectObservation]:
+        async with self.engine.connect() as connection:
+            await self._set_scope(connection, scope)
+            rows = await connection.execute(
+                text(
+                    """
+                    SELECT o.memory_id::text AS memory_id, o.event_id::text AS event_id,
+                           o.affect, o.observed_at,
+                           o.expires_at, o.recorded_at
+                    FROM memory_affect_observation o
+                    JOIN memory_item m ON m.id=o.memory_id
+                    JOIN memory_event e ON e.id=o.event_id
+                    WHERE m.id=:id AND m.tenant_id=:tenant_id AND m.user_id=:user_id
+                      AND m.agent_id=:agent_id
+                      AND m.status IN ('active','expired','archived','superseded')
+                      AND m.layer='L1'
+                      AND (e.tenant_id,e.user_id,e.agent_id)=(m.tenant_id,m.user_id,m.agent_id)
+                      AND e.prohibited_from_memory=false
+                      AND GREATEST(o.observed_at, o.recorded_at, e.occurred_at, e.recorded_at)
+                          <= COALESCE(CAST(:as_of AS timestamptz), 'infinity'::timestamptz)
+                    ORDER BY o.observed_at DESC, o.recorded_at DESC, o.event_id
+                    LIMIT :limit
+                    """
+                ),
+                {"id": memory_id, "limit": limit, "as_of": as_of, **scope.model_dump()},
+            )
+            return [AffectObservation.model_validate(row) for row in rows.mappings()]
 
     async def list_audit(self, scope: MemoryScope, limit: int) -> list[AuditEntry]:
         async with self.engine.connect() as connection:
@@ -1624,9 +2287,34 @@ class PostgresRepository:
         candidate_count: int,
         selected_memory_ids: list[str],
         truncated: bool,
+        *,
+        reinforced_memory_ids: Sequence[str] = (),
+        recalled_at: datetime | None = None,
     ) -> None:
         async with self.engine.begin() as connection:
             await self._set_scope(connection, scope)
+            reinforce = sorted(set(selected_memory_ids).intersection(reinforced_memory_ids))
+            if reinforce and recalled_at is not None and purpose in {"conversation", "task"}:
+                await connection.execute(
+                    text("""
+                        WITH eligible AS (
+                            SELECT id FROM memory_item
+                            WHERE id=ANY(CAST(:ids AS uuid[]))
+                              AND tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
+                              AND status='active' AND layer IN ('L2','L3') AND sensitivity='low'
+                              AND cardinality(poisoning_flags)=0
+                              AND (valid_from IS NULL OR valid_from<=now())
+                              AND (valid_to IS NULL OR valid_to>now())
+                              AND (expires_at IS NULL OR expires_at>now())
+                              AND CAST(:recalled_at AS timestamptz) BETWEEN now()-interval '5 minutes' AND now()
+                              AND (last_reinforced_at IS NULL OR last_reinforced_at<now()-interval '1 hour')
+                            ORDER BY id FOR NO KEY UPDATE
+                        )
+                        UPDATE memory_item m SET last_reinforced_at=now()
+                        FROM eligible WHERE m.id=eligible.id
+                    """),
+                    {**scope.model_dump(), "ids": reinforce, "recalled_at": recalled_at},
+                )
             if selected_memory_ids:
                 existing = await connection.execute(
                     text(
@@ -1702,12 +2390,50 @@ class PostgresRepository:
                 created_at=row["created_at"],
             )
 
+    async def resolve_memory_conflict_as_coexisting(
+        self, scope: MemoryScope, memory_id: str, other_id: str,
+    ) -> None:
+        params = {**scope.model_dump(), "id": memory_id, "other_id": other_id}
+        async with self.engine.begin() as connection:
+            await self._set_scope(connection, scope)
+            await self._lock_memory_subject(connection, scope, memory_id)
+            result = await connection.execute(
+                text("""
+                    WITH matching AS (
+                        SELECT from_memory_id, to_memory_id FROM memory_relation
+                        WHERE tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
+                          AND relation='contradicts'
+                          AND ((from_memory_id=:id AND to_memory_id=:other_id)
+                               OR (from_memory_id=:other_id AND to_memory_id=:id))
+                    ), changed AS (
+                        UPDATE memory_relation r SET resolved_at=now()
+                        FROM matching m
+                        WHERE r.from_memory_id=m.from_memory_id AND r.to_memory_id=m.to_memory_id
+                          AND r.relation='contradicts' AND r.resolved_at IS NULL
+                        RETURNING 1
+                    )
+                    SELECT EXISTS (SELECT 1 FROM matching), EXISTS (SELECT 1 FROM changed)
+                """),
+                params,
+            )
+            found, changed = result.one()
+            if not found:
+                raise NotFoundError(memory_id)
+            if changed:
+                await self._audit(connection, scope, "conflict_coexistence", memory_id)
+
     async def review_memory(
         self, scope: MemoryScope, memory_id: str, decision: str
     ) -> MemoryReviewReceipt:
         new_status = "active" if decision == "approve" else "rejected"
+        audit_action = f"review_{decision}"
+        params = {"id": memory_id, "status": new_status, **scope.model_dump()}
         async with self.engine.begin() as connection:
             await self._set_scope(connection, scope)
+            subject_key = (
+                await self._lock_memory_subject(connection, scope, memory_id)
+                if new_status == "active" else None
+            )
             row = await connection.execute(
                 text(
                     """
@@ -1715,16 +2441,46 @@ class PostgresRepository:
                     SET status=:status, updated_at=now()
                     WHERE id=:id AND tenant_id=:tenant_id AND user_id=:user_id
                       AND agent_id=:agent_id AND status='quarantined'
+                      AND (
+                        :status='rejected'
+                        OR (cardinality(poisoning_flags)=0 AND sensitivity NOT IN ('high','secret'))
+                      )
                     RETURNING id, subject_key, kind, statement, confidence
                     """
                 ),
-                {"id": memory_id, "status": new_status, **scope.model_dump()},
+                params,
             )
             reviewed = row.mappings().first()
             if reviewed is None:
+                replay = await connection.execute(
+                    text(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1 FROM memory_item m
+                            WHERE m.id=:id AND m.tenant_id=:tenant_id AND m.user_id=:user_id
+                              AND m.agent_id=:agent_id AND m.status=:status
+                              AND (:status='rejected' OR (
+                                  cardinality(m.poisoning_flags)=0
+                                  AND m.sensitivity NOT IN ('high','secret')
+                              ))
+                              AND :action = (
+                                  SELECT a.action FROM memory_audit a
+                                  WHERE a.tenant_id=m.tenant_id AND a.user_id=m.user_id
+                                    AND a.agent_id=m.agent_id AND a.target_id=m.id::text
+                                    AND a.action IN ('review_approve','review_reject')
+                                  ORDER BY a.created_at DESC, a.id DESC LIMIT 1
+                              )
+                        )
+                        """
+                    ),
+                    {**params, "action": audit_action},
+                )
+                if replay.scalar_one():
+                    return MemoryReviewReceipt(memory_id=memory_id, status=new_status)
                 raise NotFoundError(memory_id)
             if new_status == "active" and reviewed["subject_key"]:
-                await self._lock_subject(connection, scope, reviewed["subject_key"])
+                if reviewed["subject_key"] != subject_key:
+                    raise MemorySourcesChanged()
                 if await self._link_unresolved_conflicts(
                     connection,
                     scope,
@@ -1735,7 +2491,7 @@ class PostgresRepository:
                     reviewed["confidence"],
                 ):
                     await self._audit(connection, scope, "conflict_detected", memory_id)
-            await self._audit(connection, scope, f"review_{decision}", memory_id)
+            await self._audit(connection, scope, audit_action, memory_id)
         return MemoryReviewReceipt(memory_id=memory_id, status=new_status)
 
     async def process_one_deletion(self) -> bool:
@@ -1781,6 +2537,13 @@ class PostgresRepository:
                 return False
             await connection.execute(
                 text(
+                    "DELETE FROM memory_affect_observation "
+                    "WHERE event_id=ANY(CAST(:event_ids AS uuid[]))"
+                ),
+                {"event_ids": row["event_ids"]},
+            )
+            await connection.execute(
+                text(
                     """
                     DELETE FROM memory_candidate_decision
                     WHERE event_id = ANY(CAST(:event_ids AS uuid[]))
@@ -1804,10 +2567,15 @@ class PostgresRepository:
                     UPDATE memory_event
                     SET content='[deleted-by-user]', metadata='{}'::jsonb,
                         ciphertext=NULL, ciphertext_key_id=NULL, ciphertext_retry_at=NULL,
+                        occurred_utc_offset_seconds=NULL, background_eligible_at=NULL,
                         prohibited_from_memory=true, redacted_at=now()
                     WHERE id = ANY(CAST(:ids AS uuid[]))
                     """
                 ),
+                {"ids": row["event_ids"]},
+            )
+            await connection.execute(
+                text("DELETE FROM memory_consolidation_run WHERE source_ids && CAST(:ids AS uuid[])"),
                 {"ids": row["event_ids"]},
             )
             canary = await connection.execute(
@@ -1825,6 +2593,22 @@ class PostgresRepository:
                       OR EXISTS (
                         SELECT 1 FROM memory_evidence
                         WHERE memory_id = ANY(CAST(:memory_ids AS uuid[]))
+                           OR event_id = ANY(CAST(:event_ids AS uuid[]))
+                      )
+                      OR EXISTS (
+                        SELECT 1 FROM memory_dependency
+                        WHERE memory_id = ANY(CAST(:memory_ids AS uuid[]))
+                           OR event_id = ANY(CAST(:event_ids AS uuid[]))
+                      )
+                      OR EXISTS (
+                        SELECT 1 FROM memory_relation
+                        WHERE from_memory_id = ANY(CAST(:memory_ids AS uuid[]))
+                           OR to_memory_id = ANY(CAST(:memory_ids AS uuid[]))
+                      )
+                      OR EXISTS (
+                        SELECT 1 FROM memory_affect_observation
+                        WHERE memory_id=ANY(CAST(:memory_ids AS uuid[]))
+                           OR event_id=ANY(CAST(:event_ids AS uuid[]))
                       )
                       OR EXISTS (
                         SELECT 1 FROM memory_recall_diagnostic
@@ -1836,6 +2620,10 @@ class PostgresRepository:
                            OR stored_memory_id = ANY(CAST(:memory_ids AS uuid[]))
                       )
                       OR EXISTS (
+                        SELECT 1 FROM memory_consolidation_run
+                        WHERE source_ids && CAST(:event_ids AS uuid[])
+                      )
+                      OR EXISTS (
                         SELECT 1 FROM memory_event
                         WHERE id = ANY(CAST(:event_ids AS uuid[]))
                           AND (
@@ -1844,6 +2632,8 @@ class PostgresRepository:
                             OR ciphertext IS NOT NULL
                             OR prohibited_from_memory=false
                             OR redacted_at IS NULL
+                            OR occurred_utc_offset_seconds IS NOT NULL
+                            OR background_eligible_at IS NOT NULL
                           )
                       ) AS failed
                     """
@@ -1921,7 +2711,7 @@ class PostgresRepository:
                     UPDATE memory_event e
                     SET content='[retention-expired]', metadata='{}'::jsonb,
                         ciphertext=NULL, ciphertext_key_id=NULL, ciphertext_retry_at=NULL,
-                        redacted_at=now()
+                        occurred_utc_offset_seconds=NULL, background_eligible_at=NULL, redacted_at=now()
                     WHERE e.redacted_at IS NULL
                       AND e.recorded_at < now() - make_interval(days => :retention_days)
                       AND NOT EXISTS (
@@ -1985,7 +2775,7 @@ class PostgresRepository:
         for event in events.mappings():
             try:
                 payload = self._event_payload(str(event["id"]), event)
-            except (InvalidTag, ValueError):
+            except EventPayloadUnreadable:
                 failed_ids.append(event["id"])
                 continue
             encrypted.append({
@@ -2174,7 +2964,27 @@ class PostgresRepository:
             conflict_memory_ids=list(row["conflict_ids"]),
             query_matched=row.get("query_matched", False),
             rerank_eligible=row.get("rerank_eligible", False),
+            expires_at=row.get("expires_at"),
+            affect=row.get("affect"),
         )
+
+    @staticmethod
+    async def _lock_memory_subject(
+        connection: AsyncConnection, scope: MemoryScope, memory_id: str
+    ) -> str | None:
+        row = await connection.execute(
+            text(
+                """
+                SELECT subject_key FROM memory_item
+                WHERE id=:id AND tenant_id=:tenant_id AND user_id=:user_id AND agent_id=:agent_id
+                """
+            ),
+            {"id": memory_id, **scope.model_dump()},
+        )
+        subject_key = row.scalar_one_or_none()
+        if subject_key:
+            await PostgresRepository._lock_subject(connection, scope, subject_key)
+        return subject_key
 
     @staticmethod
     async def _lock_subject(
@@ -2200,7 +3010,6 @@ class PostgresRepository:
         statement: str,
         confidence: float,
     ) -> bool:
-        normalized = " ".join(statement.lower().split())
         inserted = await connection.execute(
             text(
                 """
@@ -2211,11 +3020,28 @@ class PostgresRepository:
                 SELECT :tenant_id, :user_id, :agent_id, :memory_id, m.id,
                        'contradicts', LEAST(:confidence, m.confidence)
                 FROM memory_item m
+                JOIN memory_item incoming ON incoming.id=CAST(:memory_id AS uuid)
                 WHERE m.tenant_id=:tenant_id AND m.user_id=:user_id
                   AND m.agent_id=:agent_id AND m.id<>CAST(:memory_id AS uuid)
                   AND m.status='active' AND m.subject_key=:subject_key
+                  AND incoming.layer='L3' AND m.layer='L3'
                   AND m.kind=:kind AND m.valid_to IS NULL
-                  AND lower(regexp_replace(trim(m.statement), '\\s+', ' ', 'g'))<>:normalized
+                  AND GREATEST(
+                        COALESCE(m.valid_from, '-infinity'::timestamptz),
+                        COALESCE(incoming.valid_from, '-infinity'::timestamptz)
+                      ) < LEAST(
+                        COALESCE(m.expires_at, 'infinity'::timestamptz),
+                        COALESCE(incoming.valid_to, 'infinity'::timestamptz),
+                        COALESCE(incoming.expires_at, 'infinity'::timestamptz)
+                      )
+                  AND rtrim(lower(regexp_replace(trim(m.statement), '\\s+', ' ', 'g')), '。！!. ')
+                      <> rtrim(lower(regexp_replace(trim(:statement), '\\s+', ' ', 'g')), '。！!. ')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM memory_relation r
+                      WHERE r.relation='contradicts' AND r.resolved_at IS NOT NULL
+                        AND ((r.from_memory_id=incoming.id AND r.to_memory_id=m.id)
+                             OR (r.from_memory_id=m.id AND r.to_memory_id=incoming.id))
+                  )
                 ON CONFLICT DO NOTHING
                 RETURNING to_memory_id
                 """
@@ -2225,7 +3051,7 @@ class PostgresRepository:
                 "memory_id": memory_id,
                 "subject_key": subject_key,
                 "kind": kind,
-                "normalized": normalized,
+                "statement": statement,
                 "confidence": confidence,
             },
         )

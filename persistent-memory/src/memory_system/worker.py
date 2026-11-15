@@ -2,23 +2,39 @@ import asyncio
 import signal
 from collections.abc import Awaitable, Callable
 from functools import partial
+from time import perf_counter
 
 import structlog
-from prometheus_client import Counter
+from prometheus_client import Counter, Histogram, start_http_server
 
 from memory_system.consolidation import Consolidator, HeuristicExtractor, HybridExtractor
 from memory_system.dev import check_worker_database
 from memory_system.embedding import EmbeddingClient, build_embedding_client
-from memory_system.llm import ModelResponseTooLarge, OpenAICompatibleExtractor
+from memory_system.llm import (
+    ModelResponseTooLarge,
+    OpenAICompatibleExtractor,
+    build_consolidation_extractor,
+)
 from memory_system.policy import MemoryPolicy
-from memory_system.postgres import PostgresRepository
+from memory_system.postgres import EventPayloadUnreadable, NotFoundError, PostgresRepository
 from memory_system.runtime import configure_event_loop
 from memory_system.settings import Settings
+from memory_system.system import ConsolidationUnavailable, MemoryPolicyRejected, MemorySystem
 
 _WORKER_JOBS = Counter(
     "memory_worker_jobs_total",
     "Background memory jobs processed",
     ("kind", "result"),
+)
+_DELETION_DURATION = Histogram(
+    "memory_worker_deletion_duration_seconds",
+    "Elapsed time of a worker deletion attempt, including the database claim",
+    ("result",),
+)
+_CONSOLIDATION_DISCOVERY_DURATION = Histogram(
+    "memory_worker_consolidation_discovery_duration_seconds",
+    "Elapsed time of background consolidation candidate discovery",
+    ("vector_matching",),
 )
 
 
@@ -43,13 +59,16 @@ async def process_one_extraction(
 
 
 async def process_one_deletion(repository: PostgresRepository) -> bool:
+    started = perf_counter()
     try:
         worked = await repository.process_one_deletion()
         if worked:
             _WORKER_JOBS.labels(kind="deletion", result="completed").inc()
+            _DELETION_DURATION.labels(result="completed").observe(perf_counter() - started)
         return worked
     except Exception as exc:  # noqa: BLE001 - one deletion must not stop all background work
         _WORKER_JOBS.labels(kind="deletion", result="failed").inc()
+        _DELETION_DURATION.labels(result="failed").observe(perf_counter() - started)
         structlog.get_logger().error(
             "memory_deletion_failed", error_code=type(exc).__name__
         )
@@ -114,11 +133,56 @@ async def backfill_embeddings(repository: PostgresRepository, client: EmbeddingC
             await repository.store_embedding(memory_id, statement, client.model, vector)
 
 
+async def process_background_consolidation(
+    system: MemorySystem, embedding_client: EmbeddingClient | None = None,
+) -> None:
+    repository = system.repository
+    async with repository.background_consolidation_lock() as acquired:
+        if not acquired:
+            return
+        failures = 0
+        embedding_options = {
+            "embedding_model": embedding_client.model,
+            "embedding_dimensions": embedding_client.dimensions,
+        } if embedding_client is not None else {}
+        with _CONSOLIDATION_DISCOVERY_DURATION.labels(
+            vector_matching="enabled" if embedding_client is not None else "disabled"
+        ).time():
+            batches = await repository.discover_background_consolidation_batches(**embedding_options)
+        for scope, ids in batches:
+            if len(ids) < 2 or await repository.background_consolidation_completed(scope, ids):
+                continue
+            try:
+                episodes = await system.propose_consolidation(scope, ids, background=True)
+                procedures = await system.propose_consolidation(
+                    scope, ids, kind="procedure", background=True
+                )
+                drafts = episodes[:2] + procedures[:1]
+            except NotFoundError:
+                continue
+            except (ConsolidationUnavailable, EventPayloadUnreadable) as exc:
+                _WORKER_JOBS.labels(kind="consolidation", result="failed").inc()
+                structlog.get_logger().warning(
+                    "memory_background_consolidation_batch_failed", error_code=type(exc).__name__
+                )
+                await repository.complete_background_consolidation(scope, ids, retry=True)
+                failures += 1
+                if failures >= 2:
+                    return
+                continue
+            except MemoryPolicyRejected:
+                drafts = []
+            if await repository.complete_background_consolidation(scope, ids, drafts=drafts):
+                _WORKER_JOBS.labels(kind="consolidation", result="completed").inc()
+            return
+
+
 async def maintenance_loop(
     repository: PostgresRepository,
     raw_event_retention_days: int,
     stop_event: asyncio.Event,
     embedding_client: EmbeddingClient | None = None,
+    background_system: MemorySystem | None = None,
 ) -> None:
     log = structlog.get_logger()
     while not stop_event.is_set():
@@ -131,6 +195,12 @@ async def maintenance_loop(
                 await backfill_embeddings(repository, embedding_client)
             except Exception as exc:  # noqa: BLE001 - lexical recall remains available
                 log.error("memory_embedding_backfill_failed", error_code=type(exc).__name__)
+        if background_system is not None and not stop_event.is_set():
+            try:
+                await process_background_consolidation(background_system, embedding_client)
+            except Exception as exc:  # noqa: BLE001 - retry on the next maintenance tick
+                _WORKER_JOBS.labels(kind="consolidation", result="failed").inc()
+                log.error("memory_background_consolidation_failed", error_code=type(exc).__name__)
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=60)
         except TimeoutError:
@@ -157,11 +227,25 @@ async def run_worker(stop_event: asyncio.Event | None = None) -> None:
     log = structlog.get_logger()
     stop_event = stop_event or asyncio.Event()
     embedding_client = None
+    background_model = None
+    metrics_server = None
     try:
         embedding_client = build_embedding_client(settings)
+        background_system = None
+        background_model = build_consolidation_extractor(settings)
+        if background_model is not None:
+            background_system = MemorySystem(
+                repository, MemoryPolicy(settings.working_memory_ttl_hours),
+                settings.max_context_tokens, consolidation_extractor=background_model,
+            )
+        if settings.worker_metrics_port is not None:
+            metrics_server, _ = start_http_server(
+                settings.worker_metrics_port, addr=settings.worker_metrics_host
+            )
         await asyncio.gather(
             maintenance_loop(
-                repository, settings.raw_event_retention_days, stop_event, embedding_client
+                repository, settings.raw_event_retention_days, stop_event, embedding_client,
+                background_system,
             ),
             worker_loop(
                 partial(process_one_deletion, repository),
@@ -182,10 +266,15 @@ async def run_worker(stop_event: asyncio.Event | None = None) -> None:
         raise
     finally:
         try:
+            if metrics_server is not None:
+                await asyncio.to_thread(metrics_server.shutdown)
+                metrics_server.server_close()
             close_extractor = getattr(consolidator.extractor, "close", None)
             if close_extractor is not None:
                 close_extractor()
         finally:
+            if background_model is not None:
+                background_model.close()
             if embedding_client is not None:
                 embedding_client.http.close()
             await repository.close()

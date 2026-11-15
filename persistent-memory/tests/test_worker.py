@@ -1,19 +1,62 @@
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
+import httpx
 import pytest
+from prometheus_client import REGISTRY, start_http_server
 
 from memory_system.consolidation import Consolidator, HeuristicExtractor
 from memory_system.models import EventJob, EventSource, InteractionEvent, MemoryLayer
 from memory_system.policy import MemoryPolicy
+from memory_system.system import ConsolidationUnavailable
 from memory_system.worker import (
     maintenance_loop,
+    process_background_consolidation,
     process_extraction_iteration,
     process_one_deletion,
     process_one_extraction,
     run_worker,
     worker_loop,
 )
+
+
+@pytest.mark.asyncio
+async def test_background_consolidation_continues_after_one_batch_fails():
+    attempts = []
+    completed = []
+
+    class Repository:
+        @asynccontextmanager
+        async def background_consolidation_lock(self):
+            yield True
+
+        async def discover_background_consolidation_batches(self):
+            return [("scope", ["broken", "second-source"]), ("scope", ["healthy", "second-source"])]
+
+        async def background_consolidation_completed(self, scope, ids):
+            return False
+
+        async def complete_background_consolidation(self, scope, ids, *, drafts=(), retry=False):
+            completed.append((ids[0], retry))
+            return True
+
+    class System:
+        repository = Repository()
+
+        async def propose_consolidation(self, scope, ids, *, kind="episode", background):
+            attempts.append((ids[0], kind))
+            if ids[0] == "broken":
+                raise ConsolidationUnavailable()
+            return []
+
+    metric = "memory_worker_consolidation_discovery_duration_seconds_count"
+    labels = {"vector_matching": "disabled"}
+    before = REGISTRY.get_sample_value(metric, labels) or 0
+    await process_background_consolidation(System())
+    assert REGISTRY.get_sample_value(metric, labels) == before + 1
+    assert attempts == [("broken", "episode"), ("healthy", "episode"), ("healthy", "procedure")]
+    assert completed == [("broken", True), ("healthy", False)]
 
 
 class StubJobRepository:
@@ -113,9 +156,13 @@ async def test_deletion_failure_does_not_escape_worker_iteration() -> None:
         async def process_one_deletion(self):
             raise RuntimeError("broken deletion")
 
+    sample = "memory_worker_deletion_duration_seconds_count"
+    labels = {"result": "failed"}
+    before = REGISTRY.get_sample_value(sample, labels) or 0
     worked = await process_one_deletion(FailingDeletionRepository())
 
     assert worked is False
+    assert REGISTRY.get_sample_value(sample, labels) == before + 1
 
 
 @pytest.mark.asyncio
@@ -197,6 +244,14 @@ async def test_run_worker_processes_deletions_while_extraction_is_waiting(monkey
     release = asyncio.Event()
     deleted = asyncio.Event()
     stop = asyncio.Event()
+    metrics_server = None
+
+    def start_test_metrics_server(port, *, addr):
+        nonlocal metrics_server
+        assert port == 9091
+        server, thread = start_http_server(0, addr=addr)
+        metrics_server = server
+        return server, thread
 
     class Repository:
         async def claim_next_extraction(self):
@@ -205,8 +260,10 @@ async def test_run_worker_processes_deletions_while_extraction_is_waiting(monkey
 
         async def process_one_deletion(self):
             await extracting.wait()
+            if deleted.is_set():
+                return False
             deleted.set()
-            return False
+            return True
 
         async def run_maintenance(self, retention_days):
             pass
@@ -221,9 +278,12 @@ async def test_run_worker_processes_deletions_while_extraction_is_waiting(monkey
         "JWT_AUDIENCE": "audience",
         "DEV_JWT_SECRET": "development-only-secret-at-least-32-characters",
         "WORKER_CONCURRENCY": "1",
+        "WORKER_METRICS_HOST": "127.0.0.1",
+        "WORKER_METRICS_PORT": "9091",
     }.items():
         monkeypatch.setenv(f"MEMORY_{key}", value)
     monkeypatch.setattr("memory_system.worker.check_worker_database", lambda _: None)
+    monkeypatch.setattr("memory_system.worker.start_http_server", start_test_metrics_server)
     monkeypatch.setattr(
         "memory_system.worker.PostgresRepository.from_url", lambda _, **kwargs: Repository()
     )
@@ -231,7 +291,14 @@ async def test_run_worker_processes_deletions_while_extraction_is_waiting(monkey
     try:
         await asyncio.wait_for(deleted.wait(), timeout=2)
         assert not release.is_set()
+        assert metrics_server is not None
+        url = f"http://127.0.0.1:{metrics_server.server_port}/metrics"
+        async with httpx.AsyncClient(trust_env=False, timeout=2) as client:
+            response = await client.get(url)
+        assert response.status_code == 200
+        assert 'memory_worker_deletion_duration_seconds_count{result="completed"}' in response.text
     finally:
         stop.set()
         release.set()
         await asyncio.wait_for(task, timeout=2)
+    assert metrics_server.socket.fileno() == -1

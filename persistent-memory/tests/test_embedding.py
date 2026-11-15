@@ -1,4 +1,5 @@
 import json
+import math
 
 import httpx
 import pytest
@@ -26,3 +27,38 @@ def test_embedding_preserves_input_order_and_checks_vectors(index, vector, valid
         else:
             with pytest.raises(ValueError, match="embedding response"):
                 client.embed(["甲", "乙"])
+
+
+def test_embedding_stops_reading_oversized_stream() -> None:
+    class OversizedStream(httpx.SyncByteStream):
+        closed = False
+
+        def __iter__(self):
+            for _ in range(65):
+                yield b" " * (64 * 1024)
+            raise AssertionError("client continued consuming an oversized response")
+
+        def close(self):
+            self.closed = True
+
+    stream = OversizedStream()
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, stream=stream))
+    with (
+        httpx.Client(base_url="http://test/", transport=transport) as http,
+        pytest.raises(ValueError, match="exceeded the byte limit"),
+    ):
+        EmbeddingClient(http, "test-model", 2).embed(["甲"])
+    assert stream.closed
+
+
+@pytest.mark.parametrize("scale", [1e300, 1e-300])
+def test_embedding_normalizes_extreme_finite_vectors(scale: float) -> None:
+    transport = httpx.MockTransport(
+        lambda _: httpx.Response(
+            200, json={"data": [{"index": 0, "embedding": [3 * scale, 4 * scale]}]}
+        )
+    )
+    with httpx.Client(base_url="http://test/", transport=transport) as http:
+        vector, = EmbeddingClient(http, "test-model", 2).embed(["甲"])
+    assert vector == pytest.approx([0.6, 0.8])
+    assert math.hypot(*vector) == pytest.approx(1)

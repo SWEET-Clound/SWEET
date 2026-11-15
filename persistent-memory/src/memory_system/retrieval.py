@@ -52,6 +52,8 @@ def _render_item(item: MemoryContextItem) -> str:
             "source_event_ids": item.source_event_ids,
             "conflict_memory_ids": item.conflict_memory_ids,
             "requires_confirmation": bool(item.conflict_memory_ids),
+            **({"expires_at": item.expires_at.isoformat()} if item.expires_at else {}),
+            **({"affect_observation": item.affect.model_dump(mode="json")} if item.affect else {}),
         },
         ensure_ascii=False,
         separators=(",", ":"),
