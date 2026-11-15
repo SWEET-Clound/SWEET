@@ -1,0 +1,65 @@
+rule_files:
+  - alerts.yml
+evaluation_interval: 1m
+tests:
+  - name: sustained write burst
+    interval: 1m
+    input_series:
+      - series: 'memory_rate_limited_writes_total{job="memory",operation="event"}'
+        values: '0+10x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: MemoryWriteBurst
+        exp_alerts:
+          - exp_labels:
+              job: memory
+              operation: event
+              severity: warning
+            exp_annotations:
+              summary: Memory write limits are being repeatedly exceeded
+  - name: context fallback at substantial volume
+    interval: 1m
+    input_series:
+      - series: 'memory_recall_outcomes_total{job="memory",purpose="task",outcome="context_only"}'
+        values: '0+20x30'
+      - series: 'memory_recall_outcomes_total{job="memory",purpose="task",outcome="matched"}'
+        values: '0+5x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: MemoryRecallContextOnly
+        exp_alerts:
+          - exp_labels:
+              job: memory
+              purpose: task
+              severity: warning
+            exp_annotations:
+              summary: Memory recall frequently falls back to contextual candidates
+  - name: low volume must not page for fallback ratio
+    interval: 1m
+    input_series:
+      - series: 'memory_recall_outcomes_total{job="memory",purpose="task",outcome="context_only"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: MemoryRecallContextOnly
+        exp_alerts: []
+  - name: separate services stay below the write threshold
+    interval: 1m
+    input_series:
+      - series: 'memory_rate_limited_writes_total{job="memory-a",operation="event"}'
+        values: '0+2x10'
+      - series: 'memory_rate_limited_writes_total{job="memory-b",operation="event"}'
+        values: '0+2x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: MemoryWriteBurst
+        exp_alerts: []
+  - name: counter reset must not create a write burst
+    interval: 1m
+    input_series:
+      - series: 'memory_rate_limited_writes_total{job="memory",operation="event"}'
+        values: '100 101 102 0 1 2 3 4 5 6'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: MemoryWriteBurst
+        exp_alerts: []

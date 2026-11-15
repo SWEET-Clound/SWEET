@@ -1,0 +1,26 @@
+groups:
+  - name: persistent-memory
+    rules:
+      - alert: MemoryWriteBurst
+        expr: sum by (job, operation) (increase(memory_rate_limited_writes_total[5m])) >= 20
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Memory write limits are being repeatedly exceeded
+      - alert: MemoryRecallContextOnly
+        expr: |
+          (
+            sum by (job, purpose) (
+              increase(memory_recall_outcomes_total{outcome="context_only"}[15m])
+            )
+            /
+            sum by (job, purpose) (increase(memory_recall_outcomes_total[15m]))
+          ) > 0.5
+          and on (job, purpose)
+          sum by (job, purpose) (increase(memory_recall_outcomes_total[15m])) >= 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Memory recall frequently falls back to contextual candidates
